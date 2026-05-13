@@ -1,8 +1,23 @@
 // Copyright (c) luaugo contributors. Licensed under the MIT License.
 // luau-bcrunner: feed a precompiled Luau bytecode blob to the official
-// Luau VM and observe the result. Reads bytecode from argv[1] (or stdin
-// if argv[1] is "-") and executes it in a sandboxed Luau state with the
-// standard library opened.
+// Luau VM and observe the result. Reads bytecode from a file path
+// supplied as a positional argument, or stdin if the path is "-".
+//
+// Usage: bcrunner [--no-sandbox] [--no-print-override]
+//                 [--chunkname NAME] <bytecode-file|->
+//
+// Flags:
+//   --no-sandbox         Skip luaL_sandbox/luaL_sandboxthread. Allows
+//                        the script to declare new globals (required
+//                        for the upstream conformance fixtures which
+//                        define top-level helper functions).
+//   --no-print-override  Use upstream's default print() instead of the
+//                        in-harness writeStdout (which discards
+//                        trailing newlines on empty calls).
+//   --chunkname NAME     Use NAME as the chunk identity passed to
+//                        luau_load (default: the file path). Some
+//                        fixtures embed their expected source file
+//                        name in error-message assertions.
 //
 // Exit codes:
 //   0  - bytecode loaded and main chunk returned (results printed to stdout)
@@ -46,21 +61,45 @@ static int writeStdout(lua_State* L) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <bytecode-file|->\n", argv[0]);
+    bool sandbox = true;
+    bool overridePrint = true;
+    const char* path = nullptr;
+    const char* chunkname = nullptr;
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--no-sandbox") == 0) {
+            sandbox = false;
+        } else if (strcmp(argv[i], "--no-print-override") == 0) {
+            overridePrint = false;
+        } else if (strcmp(argv[i], "--chunkname") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "bcrunner: --chunkname requires a value\n");
+                return 1;
+            }
+            chunkname = argv[++i];
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            fprintf(stderr, "bcrunner: unknown flag %s\n", argv[i]);
+            return 1;
+        } else {
+            path = argv[i];
+        }
+    }
+    if (!path) {
+        fprintf(stderr,
+            "usage: %s [--no-sandbox] [--no-print-override] "
+            "[--chunkname NAME] <bytecode-file|->\n",
+            argv[0]);
         return 1;
     }
+    if (!chunkname) chunkname = path;
 
     std::vector<char> blob;
-    if (strcmp(argv[1], "-") == 0) {
-        // On Windows we'd want _setmode(_fileno(stdin), _O_BINARY) here but
-        // mingw should handle it ok; we always invoke via file argument
-        // from Go tests anyway.
+    if (strcmp(path, "-") == 0) {
         blob = readAll(stdin);
     } else {
-        FILE* f = fopen(argv[1], "rb");
+        FILE* f = fopen(path, "rb");
         if (!f) {
-            fprintf(stderr, "bcrunner: cannot open %s\n", argv[1]);
+            fprintf(stderr, "bcrunner: cannot open %s\n", path);
             return 1;
         }
         blob = readAll(f);
@@ -75,14 +114,17 @@ int main(int argc, char** argv) {
     lua_State* L = luaL_newstate();
     luaL_openlibs(L);
 
-    // Override `print` so output is line-discipline-stable for diffing.
-    lua_pushcfunction(L, writeStdout, "print");
-    lua_setglobal(L, "print");
+    if (overridePrint) {
+        lua_pushcfunction(L, writeStdout, "print");
+        lua_setglobal(L, "print");
+    }
 
-    luaL_sandbox(L);
-    luaL_sandboxthread(L);
+    if (sandbox) {
+        luaL_sandbox(L);
+        luaL_sandboxthread(L);
+    }
 
-    int loaded = luau_load(L, argv[1], blob.data(), blob.size(), 0);
+    int loaded = luau_load(L, chunkname, blob.data(), blob.size(), 0);
     if (loaded != 0) {
         const char* msg = lua_tostring(L, -1);
         fprintf(stderr, "bcrunner: load error: %s\n", msg ? msg : "(no message)");

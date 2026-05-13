@@ -113,10 +113,27 @@ func RequireAvailable(t testing.TB) {
 	}
 }
 
+// RunOptions controls how Run invokes the bcrunner harness.
+type RunOptions struct {
+	// NoSandbox disables luaL_sandbox/luaL_sandboxthread, allowing
+	// the script to declare new globals.
+	NoSandbox bool
+	// NoPrintOverride uses upstream's default print() instead of
+	// bcrunner's tab-delimited variant.
+	NoPrintOverride bool
+	// Chunkname overrides the bytecode chunk identity passed to
+	// luau_load. Use "=NAME" to get bare "NAME:line:" in error
+	// messages instead of bcrunner's default `[string "PATH"]:line:`.
+	Chunkname string
+}
+
 // Run executes blob on the upstream Luau VM and returns the result.
 // blob must be valid Luau bytecode (e.g. produced by bytecode.Encode
 // or by upstream luau-compile --binary).
-func Run(blob []byte) (Result, error) {
+func Run(blob []byte) (Result, error) { return RunWith(blob, RunOptions{}) }
+
+// RunWith is Run with explicit harness options.
+func RunWith(blob []byte, opts RunOptions) (Result, error) {
 	bin, err := HarnessPath()
 	if err != nil {
 		return Result{}, err
@@ -135,7 +152,19 @@ func Run(blob []byte) (Result, error) {
 		return Result{}, err
 	}
 
-	cmd := exec.Command(bin, tmpName)
+	args := []string{}
+	if opts.NoSandbox {
+		args = append(args, "--no-sandbox")
+	}
+	if opts.NoPrintOverride {
+		args = append(args, "--no-print-override")
+	}
+	if opts.Chunkname != "" {
+		args = append(args, "--chunkname", opts.Chunkname)
+	}
+	args = append(args, tmpName)
+
+	cmd := exec.Command(bin, args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -167,22 +196,38 @@ func MustRun(t testing.TB, blob []byte) Result {
 }
 
 // RunSource compiles source via upstream luau-compile (which must be
-// on PATH) and returns the upstream VM's execution result. Used to
-// produce a reference output to compare luaugo's against.
+// on PATH or in C:\Users\user\Downloads\luau-windows\) and returns the
+// upstream VM's execution result. Used to produce a reference output
+// to compare luaugo's against.
 func RunSource(source []byte) (Result, error) {
-	luauCompile, err := exec.LookPath("luau-compile")
+	return RunSourceWith(source, RunOptions{})
+}
+
+// RunSourceWith is RunSource with explicit harness options.
+func RunSourceWith(source []byte, opts RunOptions) (Result, error) {
+	blob, err := CompileSource(source)
 	if err != nil {
-		return Result{}, fmt.Errorf("upstreamvm: luau-compile not on PATH: %w", err)
+		return Result{}, err
+	}
+	return RunWith(blob, opts)
+}
+
+// CompileSource invokes upstream luau-compile --binary on source and
+// returns the resulting bytecode blob.
+func CompileSource(source []byte) ([]byte, error) {
+	luauCompile, err := findLuauCompile()
+	if err != nil {
+		return nil, err
 	}
 	tmpSrc, err := os.CreateTemp("", "luaugo-src-*.luau")
 	if err != nil {
-		return Result{}, err
+		return nil, err
 	}
 	tmpSrcName := tmpSrc.Name()
 	defer os.Remove(tmpSrcName)
 	if _, err := tmpSrc.Write(source); err != nil {
 		tmpSrc.Close()
-		return Result{}, err
+		return nil, err
 	}
 	tmpSrc.Close()
 
@@ -191,9 +236,26 @@ func RunSource(source []byte) (Result, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return Result{Stderr: stderr.String()}, fmt.Errorf("luau-compile failed: %w", err)
+		return nil, fmt.Errorf("luau-compile failed: %w; stderr=%s", err, stderr.String())
 	}
-	return Run(stdout.Bytes())
+	return stdout.Bytes(), nil
+}
+
+func findLuauCompile() (string, error) {
+	if p, err := exec.LookPath("luau-compile"); err == nil {
+		return p, nil
+	}
+	// Workspace fallback location used in this development environment.
+	candidates := []string{
+		`C:\Users\user\Downloads\luau-windows\luau-compile.exe`,
+		`C:\Users\user\Documents\luaugo\.upstream-bin\luau-compile.exe`,
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("upstreamvm: luau-compile not found on PATH or in workspace fallbacks")
 }
 
 // NormalizeStdout strips a trailing newline. Useful when comparing two
