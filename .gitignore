@@ -1,0 +1,23 @@
+# Build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+.go-build/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local upstream Luau source checkout used only for porting reference
+/.upstream/
+
+# Generated golden bytecode (regenerated via tools/sync-upstream)
+# tests/golden/*.luac is *committed* so contributors without upstream luau
+# can still run round-trip tests. Do NOT ignore.
