@@ -20,6 +20,10 @@ Thumbs.db
 # Local upstream Luau official binaries used for differential testing
 /.upstream-bin/
 
+# luau-bcrunner is a small C++ harness built locally; its binary is not
+# committed but the source under tools/luau-bcrunner/ is.
+/tools/luau-bcrunner/bcrunner.exe
+
 # Generated golden bytecode (regenerated via tools/sync-upstream)
 # tests/golden/*.luac is *committed* so contributors without upstream luau
 # can still run round-trip tests. Do NOT ignore.
