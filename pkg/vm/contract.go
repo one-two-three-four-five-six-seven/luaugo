@@ -79,7 +79,9 @@ func (t Type) String() string {
 }
 
 // IsGC reports whether values of type t are garbage-collected.
-func (t Type) IsGC() bool { return t > TString }
+// Mirrors upstream's `iscollectable(o)` macro (`tt >= LUA_TSTRING`),
+// which means strings ARE collectable.
+func (t Type) IsGC() bool { return t >= TString }
 
 // ----------------------------------------------------------------------
 // Status codes
