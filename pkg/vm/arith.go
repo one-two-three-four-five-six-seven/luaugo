@@ -1,0 +1,342 @@
+// Copyright (c) luaugo contributors. Licensed under the MIT License.
+// Portions derived from Luau (https://github.com/luau-lang/luau),
+// Copyright (c) 2019-2026 Roblox Corporation, MIT License.
+// Portions derived from Lua 5.x, Copyright (c) 1994-2019 Lua.org, PUC-Rio, MIT License.
+
+package vm
+
+import (
+	"math"
+	"strings"
+)
+
+// arith.go: arithmetic, length, concat, and unary helpers that may
+// invoke metamethods. Mirrors upstream lvmutils.cpp luaV_doarithimpl,
+// luaV_dolen, luaV_concat.
+
+// doArith performs the arithmetic operation identified by tm on b and
+// c and stores the result into dst. Returns true if the operation was
+// completed; on failure it raises a Lua error via panic.
+func (s *stateImpl) doArith(tm TM, b, c value) value {
+	// Fast path: both numbers.
+	if b.tag == TNumber && c.tag == TNumber {
+		return numberValue(arithNumberOp(tm, b.num, c.num))
+	}
+	// Vector arithmetic for +, -, *, /, %, unm, idiv (component-wise).
+	if (b.tag == TVector || c.tag == TVector) && tm >= TMAdd && tm <= TMUnm {
+		if r, ok := vectorArith(tm, b, c); ok {
+			return r
+		}
+	}
+	// String coercion for numeric ops: try to coerce both operands.
+	if bn, ok := b.asNumber(); ok {
+		if cn, ok2 := c.asNumber(); ok2 {
+			return numberValue(arithNumberOp(tm, bn, cn))
+		}
+	}
+	// Metamethod fallback.
+	if v, ok := s.callBinTM(b, c, tm); ok {
+		return v
+	}
+	s.arithError(tm, b, c)
+	return nilValue()
+}
+
+func arithNumberOp(tm TM, a, b float64) float64 {
+	switch tm {
+	case TMAdd:
+		return a + b
+	case TMSub:
+		return a - b
+	case TMMul:
+		return a * b
+	case TMDiv:
+		return a / b
+	case TMMod:
+		return luaMod(a, b)
+	case TMPow:
+		return math.Pow(a, b)
+	case TMIDiv:
+		return luaIDiv(a, b)
+	case TMUnm:
+		return -a
+	}
+	return 0
+}
+
+// luaMod implements Lua's `%` (matches a - floor(a/b)*b).
+func luaMod(a, b float64) float64 {
+	if b == 0 {
+		return math.NaN()
+	}
+	m := math.Mod(a, b)
+	if m != 0 && ((m < 0) != (b < 0)) {
+		m += b
+	}
+	return m
+}
+
+// luaIDiv implements Lua's `//` (floor division).
+func luaIDiv(a, b float64) float64 {
+	if b == 0 {
+		// 0//0 = NaN; n//0 = +/-inf per Lua.
+		if a == 0 {
+			return math.NaN()
+		}
+		if (a > 0) == (b >= 0) {
+			return math.Inf(1)
+		}
+		return math.Inf(-1)
+	}
+	return math.Floor(a / b)
+}
+
+// vectorArith handles vector op number / number op vector / vector op vector.
+func vectorArith(tm TM, b, c value) (value, bool) {
+	var av, bv Vector
+	if b.tag == TVector {
+		av = vectorFromValue(b)
+	} else if n, ok := b.asNumber(); ok {
+		x := float32(n)
+		av = Vector{x, x, x, x}
+	} else {
+		return nilValue(), false
+	}
+	if c.tag == TVector {
+		bv = vectorFromValue(c)
+	} else if tm != TMUnm {
+		if n, ok := c.asNumber(); ok {
+			x := float32(n)
+			bv = Vector{x, x, x, x}
+		} else {
+			return nilValue(), false
+		}
+	}
+	switch tm {
+	case TMAdd:
+		return valueFromVector(av.Add(bv)), true
+	case TMSub:
+		return valueFromVector(av.Sub(bv)), true
+	case TMMul:
+		return valueFromVector(av.Mul(bv)), true
+	case TMDiv:
+		return valueFromVector(av.Div(bv)), true
+	case TMMod:
+		return valueFromVector(Vector{
+			X: float32(luaMod(float64(av.X), float64(bv.X))),
+			Y: float32(luaMod(float64(av.Y), float64(bv.Y))),
+			Z: float32(luaMod(float64(av.Z), float64(bv.Z))),
+			W: float32(luaMod(float64(av.W), float64(bv.W))),
+		}), true
+	case TMIDiv:
+		return valueFromVector(Vector{
+			X: float32(luaIDiv(float64(av.X), float64(bv.X))),
+			Y: float32(luaIDiv(float64(av.Y), float64(bv.Y))),
+			Z: float32(luaIDiv(float64(av.Z), float64(bv.Z))),
+			W: float32(luaIDiv(float64(av.W), float64(bv.W))),
+		}), true
+	case TMPow:
+		return valueFromVector(Vector{
+			X: float32(math.Pow(float64(av.X), float64(bv.X))),
+			Y: float32(math.Pow(float64(av.Y), float64(bv.Y))),
+			Z: float32(math.Pow(float64(av.Z), float64(bv.Z))),
+			W: float32(math.Pow(float64(av.W), float64(bv.W))),
+		}), true
+	case TMUnm:
+		return valueFromVector(av.Neg()), true
+	}
+	return nilValue(), false
+}
+
+// callBinTM tries to call a binary metamethod for (a, b) under tm.
+// Returns (result, true) on success, (zero, false) if no metamethod
+// could be located on either operand. Any Lua error raised by the
+// metamethod propagates as a panic.
+func (s *stateImpl) callBinTM(a, b value, tm TM) (value, bool) {
+	mm := s.gs.getTagMethodForValue(a, tm)
+	if mm.tag == TNil {
+		mm = s.gs.getTagMethodForValue(b, tm)
+	}
+	if mm.tag == TNil {
+		return nilValue(), false
+	}
+	// Call mm(a, b) and capture the first return value.
+	resBase := s.top
+	s.push(mm)
+	s.push(a)
+	s.push(b)
+	s.callValue(resBase, 2, 1)
+	r := s.stack[resBase]
+	s.stack = s.stack[:resBase]
+	s.top = resBase
+	return r, true
+}
+
+// callUnaryTM is the unary version (for TMUnm, TMLen).
+func (s *stateImpl) callUnaryTM(a value, tm TM) (value, bool) {
+	mm := s.gs.getTagMethodForValue(a, tm)
+	if mm.tag == TNil {
+		return nilValue(), false
+	}
+	resBase := s.top
+	s.push(mm)
+	s.push(a)
+	s.push(a) // upstream passes the value twice for unary ops on certain types; harmless and matches Lua 5.1
+	s.callValue(resBase, 2, 1)
+	r := s.stack[resBase]
+	s.stack = s.stack[:resBase]
+	s.top = resBase
+	return r, true
+}
+
+// arithError raises a Lua runtime error for a failed arithmetic op.
+func (s *stateImpl) arithError(tm TM, b, c value) {
+	var bad value
+	if _, ok := b.asNumber(); !ok && b.tag != TVector {
+		bad = b
+	} else {
+		bad = c
+	}
+	op := ""
+	switch tm {
+	case TMAdd:
+		op = "add"
+	case TMSub:
+		op = "sub"
+	case TMMul:
+		op = "mul"
+	case TMDiv:
+		op = "div"
+	case TMMod:
+		op = "mod"
+	case TMPow:
+		op = "pow"
+	case TMIDiv:
+		op = "idiv"
+	case TMUnm:
+		op = "unm"
+	}
+	s.runtimeError("attempt to perform arithmetic (" + op + ") on a " + bad.tag.String() + " value")
+}
+
+// doLen implements `#v`. Calls __len for tables/userdata when present.
+func (s *stateImpl) doLen(v value) value {
+	switch v.tag {
+	case TString:
+		return numberValue(float64(v.gc.(*tString).len()))
+	case TBuffer:
+		return numberValue(float64(v.gc.(*buffer).Len()))
+	case TTable:
+		// Per Lua: __len applies only if metatable says so. Without
+		// metatable, raw length is returned. Luau follows the same rule.
+		t := v.gc.(*table)
+		if t.metatable != nil {
+			if r, ok := s.callUnaryTM(v, TMLen); ok {
+				return r
+			}
+		}
+		return numberValue(float64(t.rawLen()))
+	}
+	if r, ok := s.callUnaryTM(v, TMLen); ok {
+		return r
+	}
+	s.runtimeError("attempt to get length of a " + v.tag.String() + " value")
+	return nilValue()
+}
+
+// doConcat concatenates the n top-of-stack values into one string,
+// leaving the result at base. Mirrors luaV_concat semantics with
+// __concat fallback.
+func (s *stateImpl) doConcat(base, n int) {
+	// Walk pairs from left to right.
+	if n < 2 {
+		return
+	}
+	// Convert to strings where possible; on failure, try __concat.
+	out := make([]string, 0, n)
+	i := 0
+	for i < n {
+		v := s.stack[base+i]
+		str, ok := v.asString()
+		if !ok {
+			// Try __concat: combine first contiguous string prefix into one
+			// then call __concat(prefix, v). Simpler: call __concat(left, right)
+			// where left is either accumulated prefix or s.stack[base+i-1].
+			var left value
+			if len(out) > 0 {
+				// Materialise accumulated prefix as a single string.
+				ts := s.gs.intern(strings.Join(out, ""))
+				left = stringValue(ts)
+				out = out[:0]
+			} else if i == 0 {
+				// First item not concatenable; try __concat on (v, next).
+				if i+1 >= n {
+					s.runtimeError("attempt to concatenate a " + v.tag.String() + " value")
+				}
+				r, ok := s.callBinTM(v, s.stack[base+i+1], TMConcat)
+				if !ok {
+					s.runtimeError("attempt to concatenate a " + v.tag.String() + " value")
+				}
+				// Replace pair with result and continue.
+				s.stack[base+i+1] = r
+				i++
+				continue
+			} else {
+				left = s.stack[base+i-1]
+			}
+			r, ok := s.callBinTM(left, v, TMConcat)
+			if !ok {
+				s.runtimeError("attempt to concatenate a " + v.tag.String() + " value")
+			}
+			// Replace v with result and re-enter as a single string item.
+			s.stack[base+i] = r
+			// Loop again; the result may itself be a string, so it joins out.
+			continue
+		}
+		out = append(out, str)
+		i++
+	}
+	res := strings.Join(out, "")
+	s.stack[base] = stringValue(s.gs.intern(res))
+	// Shrink the rest of the slots.
+	for j := base + 1; j < base+n; j++ {
+		s.stack[j] = nilValue()
+	}
+}
+
+// runtimeError raises a Lua runtime error with the given message.
+// Carries Go panic semantics; pcall recovers it.
+func (s *stateImpl) runtimeError(msg string) {
+	panic(luaRTError{msg: msg, value: stringValue(s.gs.intern(msg))})
+}
+
+// runtimeErrorValue raises a Lua error with the given Lua value.
+func (s *stateImpl) runtimeErrorValue(v value) {
+	if v.tag == TString {
+		panic(luaRTError{msg: v.gc.(*tString).str(), value: v})
+	}
+	panic(luaRTError{msg: "(error object is not a string)", value: v})
+}
+
+// luaRTError is the sentinel error value that Lua-level errors travel
+// through Go's panic/recover machinery as. It is recovered at every
+// pcall and Resume boundary.
+type luaRTError struct {
+	msg   string
+	value value
+}
+
+func (e luaRTError) Error() string { return e.msg }
+func (e luaRTError) LuaValue() any {
+	switch e.value.tag {
+	case TString:
+		return e.value.gc.(*tString).str()
+	case TNumber:
+		return e.value.num
+	case TBoolean:
+		return e.value.bool_
+	case TNil:
+		return nil
+	}
+	return e.msg
+}

@@ -14,9 +14,11 @@ const (
 	// BytecodeVersionMax is the newest bytecode version luaugo will load.
 	BytecodeVersionMax uint8 = 9
 	// BytecodeVersionTarget is the version emitted by the compiler by
-	// default. It matches upstream's LBC_VERSION_TARGET to ensure
-	// byte-identical output for the most common case.
-	BytecodeVersionTarget uint8 = 6
+	// default. Empirically confirmed by running `luau-compile --binary`
+	// from upstream tag 0.720 against the entire conformance corpus:
+	// every golden blob is version 9. Upstream's source defines
+	// LBC_VERSION_TARGET=6 but the production binary emits 9.
+	BytecodeVersionTarget uint8 = 9
 
 	// TypeVersionMin is the oldest type-info encoding luaugo will load.
 	TypeVersionMin uint8 = 1

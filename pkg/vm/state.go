@@ -27,6 +27,14 @@ type stateImpl struct {
 	openUpvals *upVal       // linked list head
 	gs         *globalState // never nil while the thread is alive
 	closed     bool         // set by Close
+
+	// Tier-3 fields.
+	frames    []*callInfo // call frame stack
+	callBase  int         // current Go-function frame base (for absIndex)
+	callFunc  int         // current Go-function index (top of callee slot)
+	wrapper   *State      // cached *State view of this thread
+	co        *coroutine  // coroutine bookkeeping (nil for main thread)
+	status    Status      // last status for this thread
 }
 
 // globalState is the shared "global_State" referenced by every thread
@@ -117,9 +125,17 @@ func (s *State) close() {
 
 // absIndex resolves a Lua-style 1-based stack index (positive) or a
 // from-top index (negative). Returns -1 for unreachable indices.
+//
+// When the thread is currently executing a Go function (callBase != 0),
+// positive indices are measured from callBase so the Go function sees
+// its arguments at indices 1..nargs.
 func (s *stateImpl) absIndex(idx int) int {
 	if idx > 0 {
-		return idx - 1 // convert to 0-based
+		i := idx - 1
+		if s.callBase > 0 {
+			i = s.callBase + idx - 1
+		}
+		return i
 	}
 	if idx < 0 {
 		i := s.top + idx
@@ -167,29 +183,39 @@ func (s *stateImpl) push(v value) {
 // State method backends — exported public methods on *State call these.
 // ----------------------------------------------------------------------
 
-func (s *State) top() int { return s.impl.top }
+func (s *State) top() int {
+	if s.impl.callBase > 0 {
+		return s.impl.top - s.impl.callBase
+	}
+	return s.impl.top
+}
 
 func (s *State) setTop(idx int) {
 	si := s.impl
 	if idx < 0 {
 		// Negative idx means "remove |idx| elements from the top".
 		newTop := si.top + idx + 1
-		if newTop < 0 {
-			newTop = 0
+		if newTop < si.callBase {
+			newTop = si.callBase
 		}
 		si.stack = si.stack[:newTop]
 		si.top = newTop
 		return
 	}
-	if idx > si.top {
-		si.reserve(idx - si.top)
-		for i := si.top; i < idx; i++ {
+	// Positive idx is frame-relative when inside a Go call.
+	absTop := idx
+	if si.callBase > 0 {
+		absTop = si.callBase + idx
+	}
+	if absTop > si.top {
+		si.reserve(absTop - si.top)
+		for i := si.top; i < absTop; i++ {
 			si.stack[i] = nilValue()
 		}
 	} else {
-		si.stack = si.stack[:idx]
+		si.stack = si.stack[:absTop]
 	}
-	si.top = idx
+	si.top = absTop
 }
 
 func (s *State) checkStack(n int) bool {
@@ -367,13 +393,9 @@ func (s *State) newTable(narr, nrec int) {
 	s.impl.push(tableValue(t))
 }
 
-func (s *State) getTable(idx int) {
-	panic("vm: GetTable: Tier 3 owns this (needs metamethod dispatch)")
-}
+func (s *State) getTable(idx int) { s.getTableImpl(idx) }
 
-func (s *State) setTable(idx int) {
-	panic("vm: SetTable: Tier 3 owns this (needs metamethod dispatch)")
-}
+func (s *State) setTable(idx int) { s.setTableImpl(idx) }
 
 func (s *State) getField(idx int, name string) {
 	si := s.impl
@@ -519,56 +541,43 @@ func (s *State) rawEqual(idx1, idx2 int) bool {
 	return rawEqual(si.stack[i1], si.stack[i2])
 }
 
-func (s *State) equal(idx1, idx2 int) bool {
-	panic("vm: Equal: Tier 3 owns this (needs __eq dispatch)")
-}
+func (s *State) equal(idx1, idx2 int) bool { return s.equalImpl(idx1, idx2) }
 
-func (s *State) lessThan(idx1, idx2 int) bool {
-	panic("vm: LessThan: Tier 3 owns this (needs __lt dispatch)")
-}
+func (s *State) lessThan(idx1, idx2 int) bool { return s.lessThanImpl(idx1, idx2) }
 
 // ----------------------------------------------------------------------
 // Calls / errors
 // ----------------------------------------------------------------------
 
-func (s *State) call(int, int) {
-	panic("vm: Call: Tier 3 owns this (bytecode interpreter)")
+func (s *State) call(nargs, nresults int) { s.callImpl(nargs, nresults) }
+
+func (s *State) pcall(nargs, nresults, errfunc int) Status {
+	return s.pcallImpl(nargs, nresults, errfunc)
 }
 
-func (s *State) pcall(int, int, int) Status {
-	panic("vm: PCall: Tier 3 owns this (bytecode interpreter)")
-}
-
-func (s *State) raiseError() {
-	panic("vm: Error: Tier 3 owns this (longjmp-style unwinding)")
-}
+func (s *State) raiseError() { s.raiseErrorImplBackend() }
 
 func (s *State) errorf(format string, args ...any) {
-	panic(luaError{message: fmt.Sprintf(format, args...)})
+	msg := fmt.Sprintf(format, args...)
+	s.impl.runtimeError(msg)
 }
 
 // ----------------------------------------------------------------------
 // Coroutines / loading (Tier 3)
 // ----------------------------------------------------------------------
 
-func (s *State) newThread() *State {
-	panic("vm: NewThread: Tier 3 owns this")
+func (s *State) newThread() *State { return s.newThreadImpl() }
+
+func (co *State) resume(from *State, nargs int) Status { return co.resumeImpl(from, nargs) }
+
+func (s *State) yield(nresults int) int { return s.yieldImpl(nresults) }
+
+func (s *State) load(chunkname string, blob []byte, env int) error {
+	return s.loadImpl(chunkname, blob, env)
 }
 
-func (co *State) resume(*State, int) Status {
-	panic("vm: Resume: Tier 3 owns this")
-}
-
-func (s *State) yield(int) int {
-	panic("vm: Yield: Tier 3 owns this")
-}
-
-func (s *State) load(string, []byte, int) error {
-	panic("vm: Load: Tier 3 owns this")
-}
-
-func (s *State) loadModule(string, *bytecode.Module, int) error {
-	panic("vm: LoadModule: Tier 3 owns this")
+func (s *State) loadModule(chunkname string, m *bytecode.Module, env int) error {
+	return s.loadModuleImplPub(chunkname, m, env)
 }
 
 // ----------------------------------------------------------------------
@@ -614,14 +623,8 @@ func (s *State) collectGarbage() {
 // Libraries / sandboxing (Tier 4)
 // ----------------------------------------------------------------------
 
-func (s *State) openLibs() {
-	panic("vm: OpenLibs: Tier 4 owns this")
-}
+func (s *State) openLibs() { s.openLibsImpl() }
 
-func (s *State) sandbox() {
-	panic("vm: Sandbox: Tier 3 owns this")
-}
+func (s *State) sandbox() { s.sandboxImpl() }
 
-func (s *State) sandboxThread() {
-	panic("vm: SandboxThread: Tier 3 owns this")
-}
+func (s *State) sandboxThread() { s.sandboxThreadImpl() }
