@@ -170,7 +170,23 @@ func (co *State) resumeImpl(from *State, nargs int) Status {
 	}
 
 	// Wait for the coroutine to yield, return, or error.
+	//
+	// If `from` is itself a coroutine, our goroutine currently holds
+	// the VM mutex (acquired when we entered that outer coroutine's
+	// goroutine at line 123). We must release it here so the inner
+	// coroutine's goroutine can acquire it; otherwise the inner one
+	// blocks at mu.Lock() while we block at <-yieldCh -> deadlock.
+	//
+	// We restore the mutex when control returns. Main-thread resumers
+	// don't hold the mutex and skip the unlock/lock.
+	nestedResume := from != nil && from.impl.co != nil
+	if nestedResume {
+		mu.Unlock()
+	}
 	msg := <-c.yieldCh
+	if nestedResume {
+		mu.Lock()
+	}
 	switch msg.status {
 	case StatusOK:
 		// Push results to the resumer's stack.
