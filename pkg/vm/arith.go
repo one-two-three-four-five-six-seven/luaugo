@@ -160,16 +160,42 @@ func (s *stateImpl) callBinTM(a, b value, tm TM) (value, bool) {
 	if mm.tag == TNil {
 		return nilValue(), false
 	}
-	// Call mm(a, b) and capture the first return value.
-	resBase := s.top
+	// Call mm(a, b) and capture the first return value. We allocate
+	// the metamethod's argument area ABOVE the caller's used
+	// registers (base+MaxStackSize) so it can't overlap any live
+	// slots, and we restore both L.top and the slice length on exit.
+	resBase := metamethodBase(s, s.top)
+	savedTop := s.top
+	savedLen := len(s.stack)
+	if resBase > s.top {
+		if needLen := resBase + 3; needLen > len(s.stack) {
+			s.reserve(needLen - s.top)
+		}
+		s.top = resBase
+	}
 	s.push(mm)
 	s.push(a)
 	s.push(b)
 	s.callValue(resBase, 2, 1)
 	r := s.stack[resBase]
-	s.stack = s.stack[:resBase]
-	s.top = resBase
+	if savedLen > s.top {
+		s.stack = s.stack[:savedLen]
+	}
+	s.top = savedTop
 	return r, true
+}
+
+// metamethodBase returns the lowest stack index at which a metamethod
+// call may push its arguments without aliasing the caller's live
+// registers. Mirrors the upstream invariant that __index/__newindex
+// (and arith metamethods) allocate above ci->top.
+func metamethodBase(s *stateImpl, fallback int) int {
+	if ci := s.currentFrame(); ci != nil && ci.cl != nil && ci.cl.proto != nil {
+		if hi := ci.base + int(ci.cl.proto.MaxStackSize); hi > fallback {
+			return hi
+		}
+	}
+	return fallback
 }
 
 // callUnaryTM is the unary version (for TMUnm, TMLen).
@@ -178,14 +204,24 @@ func (s *stateImpl) callUnaryTM(a value, tm TM) (value, bool) {
 	if mm.tag == TNil {
 		return nilValue(), false
 	}
-	resBase := s.top
+	resBase := metamethodBase(s, s.top)
+	savedTop := s.top
+	savedLen := len(s.stack)
+	if resBase > s.top {
+		if needLen := resBase + 3; needLen > len(s.stack) {
+			s.reserve(needLen - s.top)
+		}
+		s.top = resBase
+	}
 	s.push(mm)
 	s.push(a)
 	s.push(a) // upstream passes the value twice for unary ops on certain types; harmless and matches Lua 5.1
 	s.callValue(resBase, 2, 1)
 	r := s.stack[resBase]
-	s.stack = s.stack[:resBase]
-	s.top = resBase
+	if savedLen > s.top {
+		s.stack = s.stack[:savedLen]
+	}
+	s.top = savedTop
 	return r, true
 }
 

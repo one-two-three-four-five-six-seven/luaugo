@@ -423,3 +423,64 @@ func (s *State) XMove(dst *State, n int) {
 	si.stack = si.stack[:si.top-n]
 	si.top -= n
 }
+
+// IsMainThread reports whether s is the main thread (not a coroutine).
+// Mirrors upstream lua_pushthread's "is main" return.
+func (s *State) IsMainThread() bool {
+	return s.impl == s.impl.gs.mainthread
+}
+
+// PushThread pushes s onto its own stack and returns true if s is the
+// main thread. Mirrors upstream lua_pushthread.
+func (s *State) PushThread() bool {
+	s.impl.push(threadValue(s.impl))
+	return s.IsMainThread()
+}
+
+// IsYieldable reports whether the current thread can yield. A thread
+// can yield iff it is a coroutine (not the main thread). luaugo does
+// not currently support metamethod-yield bans, so this matches "not
+// the main thread".
+func (s *State) IsYieldable() bool {
+	return s.impl.co != nil
+}
+
+// CoStatus returns the status of co viewed from s, using upstream's
+// status names: "running", "suspended", "normal", or "dead".
+//   - "running": co is the currently-executing thread.
+//   - "normal":  co has resumed another coroutine that is now running.
+//   - "suspended": co is fresh (never started) or yielded.
+//   - "dead":    co returned normally or errored.
+//
+// Mirrors upstream costatus() / lua_costatus.
+func (s *State) CoStatus(co *State) string {
+	if co == nil || co.impl == nil {
+		return "dead"
+	}
+	c := co.impl.co
+	if c == nil {
+		// Main thread: it's running iff s == co.
+		if co.impl == s.impl {
+			return "running"
+		}
+		return "normal"
+	}
+	if c.finished {
+		return "dead"
+	}
+	if co.impl == s.impl {
+		return "running"
+	}
+	if !c.started {
+		return "suspended"
+	}
+	// Started, not finished, not the current thread: it either yielded
+	// (suspended) or is mid-resume of another coroutine (normal). We
+	// approximate by the last recorded status.
+	if co.impl.status == StatusYield {
+		return "suspended"
+	}
+	// Default to suspended for a started, non-current coroutine when
+	// the recorded status is OK (e.g. never finished a resume).
+	return "suspended"
+}

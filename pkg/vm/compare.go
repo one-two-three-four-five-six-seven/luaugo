@@ -55,14 +55,24 @@ func (s *stateImpl) equalVal(a, b value) bool {
 }
 
 func (s *stateImpl) callEqTM(mm value, a, b value) bool {
-	base := s.top
+	base := metamethodBase(s, s.top)
+	savedTop := s.top
+	savedLen := len(s.stack)
+	if base > s.top {
+		if needLen := base + 3; needLen > len(s.stack) {
+			s.reserve(needLen - s.top)
+		}
+		s.top = base
+	}
 	s.push(mm)
 	s.push(a)
 	s.push(b)
 	s.callValue(base, 2, 1)
 	r := s.stack[base]
-	s.stack = s.stack[:base]
-	s.top = base
+	if savedLen > s.top {
+		s.stack = s.stack[:savedLen]
+	}
+	s.top = savedTop
 	return !r.isFalse()
 }
 
@@ -116,13 +126,23 @@ func (s *stateImpl) callOrderTM(a, b value, tm TM) (bool, bool) {
 	if mm.tag == TNil {
 		return false, false
 	}
-	base := s.top
+	base := metamethodBase(s, s.top)
+	savedTop := s.top
+	savedLen := len(s.stack)
+	if base > s.top {
+		if needLen := base + 3; needLen > len(s.stack) {
+			s.reserve(needLen - s.top)
+		}
+		s.top = base
+	}
 	s.push(mm)
 	s.push(a)
 	s.push(b)
 	s.callValue(base, 2, 1)
 	r := s.stack[base]
-	s.stack = s.stack[:base]
-	s.top = base
+	if savedLen > s.top {
+		s.stack = s.stack[:savedLen]
+	}
+	s.top = savedTop
 	return !r.isFalse(), true
 }

@@ -1,0 +1,598 @@
+// Copyright (c) luaugo contributors. Licensed under the MIT License.
+// Portions derived from Luau (https://github.com/luau-lang/luau),
+// Copyright (c) 2019-2026 Roblox Corporation, MIT License.
+// Portions derived from Lua 5.x, Copyright (c) 1994-2019 Lua.org, PUC-Rio, MIT License.
+
+package lib
+
+import (
+	"io"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/luaugo/luaugo/pkg/vm"
+)
+
+// base.go implements Luau's base library (the global functions:
+// print, type, tostring, pcall, etc.). Mirrors upstream
+// .upstream/VM/src/lbaselib.cpp.
+
+// Stdout is the writer used by `print`. It defaults to os.Stdout but
+// can be overridden by callers (or tests) that wish to capture output.
+var Stdout io.Writer = os.Stdout
+
+// version is the value bound to the `_VERSION` global.
+const version = "Luau"
+
+// openBase registers the base-library globals on s. It is the actual
+// implementation behind lib.OpenBase (see contract.go).
+//
+// Upstream `luaopen_base` (lbaselib.cpp) installs every entry in the
+// `base_funcs` table as a global plus the auxiliary closures used by
+// `ipairs` / `pairs` / `pcall` / `xpcall`. Because the public
+// *vm.State surface does not give us a direct handle on the globals
+// table (we have no LUA_GLOBALSINDEX), we set each global via
+// SetGlobal and then install `_G` as a proxy table whose __index /
+// __newindex forward to the real globals.
+func openBase(s *vm.State) {
+	registerBaseFunctions(s)
+
+	// _VERSION
+	s.PushString(version)
+	s.SetGlobal("_VERSION")
+
+	// _G is a proxy table that forwards reads/writes to globals.
+	installGlobalProxy(s)
+}
+
+// registerBaseFunctions installs every Luau base function as a global.
+func registerBaseFunctions(s *vm.State) {
+	entries := []vm.LFnEntry{
+		{Name: "assert", Fn: baseAssert},
+		{Name: "collectgarbage", Fn: baseCollectGarbage},
+		{Name: "error", Fn: baseError},
+		{Name: "gcinfo", Fn: baseGCInfo},
+		{Name: "getfenv", Fn: baseGetFEnv},
+		{Name: "getmetatable", Fn: baseGetMetatable},
+		{Name: "loadstring", Fn: baseLoadString},
+		{Name: "newproxy", Fn: baseNewProxy},
+		{Name: "next", Fn: baseNext},
+		{Name: "print", Fn: basePrint},
+		{Name: "rawequal", Fn: baseRawEqual},
+		{Name: "rawget", Fn: baseRawGet},
+		{Name: "rawlen", Fn: baseRawLen},
+		{Name: "rawset", Fn: baseRawSet},
+		{Name: "select", Fn: baseSelect},
+		{Name: "setfenv", Fn: baseSetFEnv},
+		{Name: "setmetatable", Fn: baseSetMetatable},
+		{Name: "tonumber", Fn: baseToNumber},
+		{Name: "tostring", Fn: baseToString},
+		{Name: "type", Fn: baseTypeName},
+		{Name: "typeof", Fn: baseTypeof},
+		{Name: "ipairs", Fn: baseIPairs},
+		{Name: "pairs", Fn: basePairs},
+		{Name: "pcall", Fn: basePCall},
+		{Name: "xpcall", Fn: baseXPCall},
+		{Name: "unpack", Fn: baseUnpack},
+	}
+	for _, e := range entries {
+		s.PushGoFunction(e.Fn, 0)
+		s.SetGlobal(e.Name)
+	}
+}
+
+// installGlobalProxy installs `_G` as a table that transparently
+// forwards reads and writes to the real globals table via
+// metamethods.
+func installGlobalProxy(s *vm.State) {
+	s.NewTable()
+	proxyIdx := s.Top()
+
+	s.NewTable() // metatable
+	s.PushGoFunction(globalIndex, 0)
+	s.SetField(-2, "__index")
+	s.PushGoFunction(globalNewIndex, 0)
+	s.SetField(-2, "__newindex")
+	s.PushString("The metatable is locked")
+	s.SetField(-2, "__metatable")
+
+	s.SetMetatable(proxyIdx)
+
+	// SetGlobal pops the proxy off the stack.
+	s.SetGlobal("_G")
+}
+
+// globalIndex implements __index for the _G proxy: t[k] -> globals[k].
+func globalIndex(s *vm.State) int {
+	if s.Type(2) != vm.TString {
+		s.PushNil()
+		return 1
+	}
+	name, _ := s.ToString(2)
+	s.GetGlobal(name)
+	return 1
+}
+
+// globalNewIndex implements __newindex for the _G proxy: t[k] = v.
+func globalNewIndex(s *vm.State) int {
+	if s.Type(2) != vm.TString {
+		s.LError("invalid global key (string expected)")
+	}
+	name, _ := s.ToString(2)
+	s.PushValue(3)
+	s.SetGlobal(name)
+	return 0
+}
+
+// ----------------------------------------------------------------------
+// assert
+// ----------------------------------------------------------------------
+
+func baseAssert(s *vm.State) int {
+	if s.Top() < 1 {
+		s.LError("missing argument #1 to 'assert'")
+	}
+	if !s.ToBoolean(1) {
+		msg := s.LOptString(2, "assertion failed!")
+		s.LError("%s", msg)
+	}
+	// Return all arguments unchanged.
+	return s.Top()
+}
+
+// ----------------------------------------------------------------------
+// collectgarbage
+// ----------------------------------------------------------------------
+
+func baseCollectGarbage(s *vm.State) int {
+	opt := s.LOptString(1, "collect")
+	switch opt {
+	case "count":
+		s.PushNumber(float64(s.GCInfo()))
+	case "collect", "stop", "restart", "step", "isrunning",
+		"setpause", "setstepmul":
+		s.PushInteger(0)
+	default:
+		s.LError("invalid option '%s' to 'collectgarbage'", opt)
+	}
+	return 1
+}
+
+// ----------------------------------------------------------------------
+// error
+// ----------------------------------------------------------------------
+
+func baseError(s *vm.State) int {
+	level := s.LOptInteger(2, 1)
+	s.SetTop(1)
+	if s.Type(1) == vm.TString && level > 0 {
+		where := s.Where(int(level))
+		if where != "" {
+			orig, _ := s.ToString(1)
+			s.PushString(where + orig)
+			s.Replace(1)
+		}
+	}
+	s.Error()
+	return 0
+}
+
+// ----------------------------------------------------------------------
+// gcinfo
+// ----------------------------------------------------------------------
+
+func baseGCInfo(s *vm.State) int {
+	s.PushInteger(int64(s.GCInfo()))
+	return 1
+}
+
+// ----------------------------------------------------------------------
+// getfenv / setfenv -- Luau strongly deprecates fenvs.
+// ----------------------------------------------------------------------
+
+func baseGetFEnv(s *vm.State) int {
+	// We don't track per-closure environments through the public API;
+	// return the globals proxy as a usable approximation.
+	s.GetGlobal("_G")
+	return 1
+}
+
+func baseSetFEnv(s *vm.State) int {
+	s.LError("'setfenv' is not supported")
+	return 0
+}
+
+// ----------------------------------------------------------------------
+// getmetatable / setmetatable
+// ----------------------------------------------------------------------
+
+func baseGetMetatable(s *vm.State) int {
+	if s.Top() < 1 {
+		s.LError("missing argument #1 to 'getmetatable'")
+	}
+	if !s.GetMetatable(1) {
+		s.PushNil()
+		return 1
+	}
+	// If the metatable has a __metatable field, return that instead.
+	if s.LGetMetafield(1, "__metatable") {
+		// LGetMetafield pushed __metatable; remove the metatable below.
+		s.Remove(-2)
+	}
+	return 1
+}
+
+func baseSetMetatable(s *vm.State) int {
+	s.LCheckType(1, vm.TTable)
+	t := s.Type(2)
+	if t != vm.TNil && t != vm.TTable {
+		s.LError("invalid argument #2 to 'setmetatable' (nil or table expected)")
+	}
+	if s.LGetMetafield(1, "__metatable") {
+		s.LError("cannot change a protected metatable")
+	}
+	// SetMetatable expects the metatable on top of the stack.
+	s.SetTop(2)
+	if !s.SetMetatable(1) {
+		s.LError("setmetatable failed")
+	}
+	// SetMetatable popped the metatable; the original table is still
+	// at idx 1. setmetatable returns the table.
+	s.PushValue(1)
+	return 1
+}
+
+// ----------------------------------------------------------------------
+// loadstring -- disabled (no runtime parser in the luaugo VM).
+// ----------------------------------------------------------------------
+
+func baseLoadString(s *vm.State) int {
+	s.PushNil()
+	s.PushString("loadstring disabled")
+	return 2
+}
+
+// ----------------------------------------------------------------------
+// newproxy
+// ----------------------------------------------------------------------
+
+func baseNewProxy(s *vm.State) int {
+	t := s.Type(1)
+	if t != vm.TNone && t != vm.TNil && t != vm.TBoolean {
+		s.LError("invalid argument #1 to 'newproxy' (nil or boolean expected)")
+	}
+	needsMt := s.ToBoolean(1)
+	_ = s.NewUserdata(0)
+	if needsMt {
+		s.NewTable()
+		s.SetMetatable(-2)
+	}
+	return 1
+}
+
+// ----------------------------------------------------------------------
+// next / pairs / ipairs
+// ----------------------------------------------------------------------
+
+func baseNext(s *vm.State) int {
+	s.LCheckType(1, vm.TTable)
+	s.SetTop(2) // ensure there is a key argument (nil for start).
+	if s.Next(1) {
+		return 2
+	}
+	s.PushNil()
+	return 1
+}
+
+func basePairs(s *vm.State) int {
+	s.LCheckType(1, vm.TTable)
+	// Return (next, t, nil).
+	s.PushGoFunction(baseNext, 0)
+	s.PushValue(1)
+	s.PushNil()
+	return 3
+}
+
+func baseINext(s *vm.State) int {
+	s.LCheckType(1, vm.TTable)
+	i := s.LCheckInteger(2)
+	i++
+	s.PushInteger(i)
+	s.RawGetI(1, int(i))
+	if s.Type(-1) == vm.TNil {
+		return 0
+	}
+	return 2
+}
+
+func baseIPairs(s *vm.State) int {
+	s.LCheckType(1, vm.TTable)
+	s.PushGoFunction(baseINext, 0)
+	s.PushValue(1)
+	s.PushInteger(0)
+	return 3
+}
+
+// ----------------------------------------------------------------------
+// print
+// ----------------------------------------------------------------------
+
+func basePrint(s *vm.State) int {
+	n := s.Top()
+	var sb strings.Builder
+	for i := 1; i <= n; i++ {
+		if i > 1 {
+			sb.WriteByte('\t')
+		}
+		sb.WriteString(s.LToLString(i))
+	}
+	sb.WriteByte('\n')
+	_, _ = io.WriteString(Stdout, sb.String())
+	return 0
+}
+
+// ----------------------------------------------------------------------
+// raw* family
+// ----------------------------------------------------------------------
+
+func baseRawEqual(s *vm.State) int {
+	if s.Top() < 2 {
+		s.LError("rawequal requires two arguments")
+	}
+	s.PushBoolean(s.RawEqual(1, 2))
+	return 1
+}
+
+func baseRawGet(s *vm.State) int {
+	s.LCheckType(1, vm.TTable)
+	if s.Top() < 2 {
+		s.LError("missing argument #2 to 'rawget'")
+	}
+	s.SetTop(2)
+	s.RawGet(1)
+	return 1
+}
+
+func baseRawSet(s *vm.State) int {
+	s.LCheckType(1, vm.TTable)
+	if s.Top() < 3 {
+		s.LError("missing arguments to 'rawset'")
+	}
+	s.SetTop(3)
+	s.RawSet(1)
+	// rawset returns the table itself.
+	s.PushValue(1)
+	return 1
+}
+
+func baseRawLen(s *vm.State) int {
+	t := s.Type(1)
+	if t != vm.TTable && t != vm.TString {
+		s.LError("rawlen: table or string expected")
+	}
+	s.Length(1)
+	return 1
+}
+
+// ----------------------------------------------------------------------
+// select
+// ----------------------------------------------------------------------
+
+func baseSelect(s *vm.State) int {
+	n := s.Top()
+	if n < 1 {
+		s.LError("bad argument #1 to 'select'")
+	}
+	if s.Type(1) == vm.TString {
+		sel, _ := s.ToString(1)
+		if len(sel) > 0 && sel[0] == '#' {
+			s.PushInteger(int64(n - 1))
+			return 1
+		}
+	}
+	i := int(s.LCheckInteger(1))
+	if i < 0 {
+		i = n + i
+	} else if i > n {
+		i = n
+	}
+	if i < 1 {
+		s.LError("index out of range")
+	}
+	return n - i
+}
+
+// ----------------------------------------------------------------------
+// tonumber / tostring / type / typeof
+// ----------------------------------------------------------------------
+
+func baseToNumber(s *vm.State) int {
+	if s.Top() < 1 {
+		s.LError("missing argument #1 to 'tonumber'")
+	}
+	if s.IsNoneOrNil(2) {
+		// Default conversion.
+		if s.Type(1) == vm.TNumber {
+			s.PushValue(1)
+			return 1
+		}
+		if str, ok := s.ToString(1); ok {
+			if n, ok := luauParseNumber(str); ok {
+				s.PushNumber(n)
+				return 1
+			}
+		}
+		s.PushNil()
+		return 1
+	}
+	base := int(s.LCheckInteger(2))
+	if base < 2 || base > 36 {
+		s.LError("bad argument #2 to 'tonumber' (base out of range)")
+	}
+	str := s.LCheckString(1)
+	str = strings.TrimSpace(str)
+	if str == "" {
+		s.PushNil()
+		return 1
+	}
+	// strconv.ParseUint handles digits 0..base-1 with letter digits
+	// for bases > 10, matching strtoul.
+	n, err := strconv.ParseUint(str, base, 64)
+	if err != nil {
+		s.PushNil()
+		return 1
+	}
+	s.PushNumber(float64(n))
+	return 1
+}
+
+// luauParseNumber parses s into a float64 using Luau's number-lexer
+// semantics: decimal, hex (`0x`), binary (`0b`), with optional `_`
+// digit separators. Trailing/leading ASCII whitespace is ignored
+// (matching upstream luaO_str2d).
+func luauParseNumber(in string) (float64, bool) {
+	s := strings.TrimSpace(in)
+	if s == "" {
+		return 0, false
+	}
+	sign := 1.0
+	switch s[0] {
+	case '+':
+		s = s[1:]
+	case '-':
+		sign = -1
+		s = s[1:]
+	}
+	if s == "" {
+		return 0, false
+	}
+	if strings.Contains(s, "_") {
+		s = strings.ReplaceAll(s, "_", "")
+		if s == "" {
+			return 0, false
+		}
+	}
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		n, err := strconv.ParseUint(s[2:], 16, 64)
+		if err != nil {
+			return 0, false
+		}
+		return sign * float64(n), true
+	}
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B') {
+		n, err := strconv.ParseUint(s[2:], 2, 64)
+		if err != nil {
+			return 0, false
+		}
+		return sign * float64(n), true
+	}
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return sign * n, true
+}
+
+func baseToString(s *vm.State) int {
+	if s.Top() < 1 {
+		s.LError("missing argument #1 to 'tostring'")
+	}
+	str := s.LToLString(1)
+	s.PushString(str)
+	return 1
+}
+
+func baseTypeName(s *vm.State) int {
+	if s.Top() < 1 {
+		s.LError("missing argument #1 to 'type'")
+	}
+	t := s.Type(1)
+	s.PushString(t.String())
+	return 1
+}
+
+func baseTypeof(s *vm.State) int {
+	if s.Top() < 1 {
+		s.LError("missing argument #1 to 'typeof'")
+	}
+	// For userdata, return __type if set.
+	if s.Type(1) == vm.TUserdata {
+		if s.LGetMetafield(1, "__type") {
+			if s.Type(-1) == vm.TString {
+				return 1
+			}
+			s.Pop(1)
+		}
+	}
+	t := s.Type(1)
+	s.PushString(t.String())
+	return 1
+}
+
+// ----------------------------------------------------------------------
+// pcall / xpcall
+// ----------------------------------------------------------------------
+
+func basePCall(s *vm.State) int {
+	if s.Top() < 1 {
+		s.LError("missing argument #1 to 'pcall'")
+	}
+	nargs := s.Top() - 1
+	st := s.PCall(nargs, vm.MultRet, 0)
+	// Insert the status boolean at index 1.
+	s.PushBoolean(st == vm.StatusOK)
+	s.Insert(1)
+	return s.Top()
+}
+
+func baseXPCall(s *vm.State) int {
+	if s.Top() < 2 {
+		s.LError("missing arguments to 'xpcall'")
+	}
+	if s.Type(2) != vm.TFunction {
+		s.LError("bad argument #2 to 'xpcall' (function expected)")
+	}
+	// Swap idx 1 (f) and idx 2 (handler) so the handler can be used
+	// as PCall's errfunc at the absolute stack position of rel idx 1.
+	s.PushValue(1) // ..., f, h, args, f
+	s.PushValue(2) // ..., f, h, args, f, h
+	s.Replace(1)   // h, h, args, f
+	s.Replace(2)   // h, f, args
+	nargs := s.Top() - 2
+	st := s.PCall(nargs, vm.MultRet, 1)
+	// Replace the handler slot with the boolean status.
+	s.PushBoolean(st == vm.StatusOK)
+	s.Replace(1)
+	return s.Top()
+}
+
+// ----------------------------------------------------------------------
+// unpack
+// ----------------------------------------------------------------------
+
+func baseUnpack(s *vm.State) int {
+	s.LCheckType(1, vm.TTable)
+	i := int(s.LOptInteger(2, 1))
+	j := int(s.LOptInteger(3, int64(tableLenN(s, 1))))
+	if i > j {
+		return 0
+	}
+	n := j - i + 1
+	if n <= 0 {
+		return 0
+	}
+	s.LCheckStack(n, "table too big to unpack")
+	for k := i; k <= j; k++ {
+		s.RawGetI(1, k)
+	}
+	return n
+}
+
+// tableLenN returns `#t` for the table at idx.
+func tableLenN(s *vm.State, idx int) int {
+	s.Length(idx)
+	n, _ := s.ToInteger(-1)
+	s.Pop(1)
+	return int(n)
+}

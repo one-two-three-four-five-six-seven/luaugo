@@ -218,17 +218,13 @@ func (s *State) Where(level int) string {
 		return ""
 	}
 	p := ci.cl.proto
-	line := 0
-	if p.LineInfo != nil && ci.savedpc-1 < len(p.LineInfo.LineInfo) && ci.savedpc > 0 {
-		line = int(p.LineInfo.LineInfo[ci.savedpc-1])
-	}
-	name := "?"
-	if p.DebugName > 0 {
-		// We don't have direct module access here; skip.
-		_ = name
+	line := lineForPC(p, ci.savedpc-1)
+	src := chunkNameForProto(si.gs, p)
+	if src == "" {
+		src = "?"
 	}
 	if line > 0 {
-		return fmt.Sprintf("%s:%d: ", name, line)
+		return fmt.Sprintf("%s:%d: ", src, line)
 	}
 	return ""
 }

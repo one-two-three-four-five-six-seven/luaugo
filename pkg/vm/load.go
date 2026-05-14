@@ -76,6 +76,7 @@ func (s *stateImpl) loadModuleImpl(chunkname string, m *bytecode.Module, env int
 	// the env on the cache; per upstream luau_load, all child protos
 	// share the main proto's env.
 	cache.env[m] = envT
+	cache.chunkname[m] = chunkname
 
 	main := m.Protos[m.MainProto]
 	mainCl := newLClosure(s.gs, envT, main, int(main.NumUpvalues))
@@ -168,12 +169,14 @@ type tableTemplateTag struct {
 type protoCache struct {
 	constants map[*bytecode.Proto][]value
 	env       map[*bytecode.Module]*table
+	chunkname map[*bytecode.Module]string
 }
 
 func newProtoCache() *protoCache {
 	return &protoCache{
 		constants: make(map[*bytecode.Proto][]value),
 		env:       make(map[*bytecode.Module]*table),
+		chunkname: make(map[*bytecode.Module]string),
 	}
 }
 

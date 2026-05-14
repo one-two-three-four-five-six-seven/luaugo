@@ -302,9 +302,23 @@ func executeProto(L *stateImpl, ci *callInfo) {
 					}
 					L.stack = L.stack[:L.top]
 				}
-				// Refresh in case stack was reallocated.
-				if cap(L.stack) >= base {
-					// no-op; just ensure base is still valid.
+				// After the call, the callee may have shrunk the
+				// backing slice below the parent's MaxStackSize area
+				// (this is the case for any Go function that pops
+				// values during its execution). Subsequent register
+				// writes inside this Lua frame need those slots back,
+				// so we re-extend the slice to base+MaxStackSize
+				// without touching L.top (which still records the
+				// post-return free slot for multret) and without
+				// zeroing surviving register values.
+				if needLen := base + int(cl.proto.MaxStackSize); len(L.stack) < needLen {
+					if cap(L.stack) < needLen {
+						grow := make([]value, needLen, needLen+(needLen/2))
+						copy(grow, L.stack)
+						L.stack = grow
+					} else {
+						L.stack = L.stack[:needLen]
+					}
 				}
 
 			case common.OpReturn:
@@ -349,70 +363,82 @@ func executeProto(L *stateImpl, ci *callInfo) {
 					pc += int(d)
 				}
 
+			// Note: for the JUMP-IF-* ops, the jump offset D is relative
+			// to the insn word (not the aux word). So when we take the
+			// jump we must NOT additionally pc++ past the aux; the +D
+			// includes the aux skip. When the condition is false we
+			// pc++ once to skip the aux word and continue. This
+			// matches upstream Luau's LOP_JUMPIF* dispatch.
 			case common.OpJumpIfEq:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				if L.equalVal(L.stack[base+int(a)], L.stack[base+int(aux)]) {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpJumpIfNotEq:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				if !L.equalVal(L.stack[base+int(a)], L.stack[base+int(aux)]) {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpJumpIfLt:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				if L.lessThanVal(L.stack[base+int(a)], L.stack[base+int(aux)]) {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpJumpIfNotLt:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				if !L.lessThanVal(L.stack[base+int(a)], L.stack[base+int(aux)]) {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpJumpIfLe:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				if L.lessEqualVal(L.stack[base+int(a)], L.stack[base+int(aux)]) {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpJumpIfNotLe:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				if !L.lessEqualVal(L.stack[base+int(a)], L.stack[base+int(aux)]) {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpJumpXEqKNil:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				eq := L.stack[base+int(a)].tag == TNil
 				if common.InsnAuxNot(aux) != 0 {
 					eq = !eq
 				}
 				if eq {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpJumpXEqKB:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				v := L.stack[base+int(a)]
 				want := common.InsnAuxKB(aux) != 0
 				eq := v.tag == TBoolean && v.bool_ == want
@@ -421,12 +447,13 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				}
 				if eq {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpJumpXEqKN:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				kv := constants[common.InsnAuxKV(aux)]
 				v := L.stack[base+int(a)]
 				eq := v.tag == TNumber && kv.tag == TNumber && v.num == kv.num
@@ -435,12 +462,13 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				}
 				if eq {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpJumpXEqKS:
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
 				kv := constants[common.InsnAuxKV(aux)]
 				v := L.stack[base+int(a)]
 				eq := v.tag == TString && kv.tag == TString && v.gc == kv.gc
@@ -449,6 +477,8 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				}
 				if eq {
 					pc += int(d)
+				} else {
+					pc++
 				}
 
 			case common.OpAdd, common.OpSub, common.OpMul, common.OpDiv, common.OpMod, common.OpPow, common.OpIdiv:
@@ -696,11 +726,240 @@ func executeProto(L *stateImpl, ci *callInfo) {
 			case common.OpPrepVarargs:
 				// Already handled by callLua.
 
-			case common.OpFastCall, common.OpFastCall1, common.OpFastCall2, common.OpFastCall2K, common.OpFastCall3:
-				// Skip fastcall — the immediately following CALL handles it.
-				// We leave the slot count to the CALL.
-				// Optionally, look up builtin fn (a) and run it directly.
-				_ = a
+			case common.OpFastCall:
+				// FASTCALL form: A=builtin id, C=skip-count to the
+				// following CALL. Args/results are taken from the
+				// CALL's registers.
+				bfid := common.Builtin(a)
+				skip := int(common.InsnC(insn))
+				if pc+skip >= len(code) {
+					L.runtimeError("FASTCALL: skip past end of code")
+				}
+				call := code[pc+skip]
+				if common.InsnOp(call) != common.OpCall {
+					L.runtimeError("FASTCALL: following insn is not CALL")
+				}
+				callA := common.InsnA(call)
+				callB := common.InsnB(call)
+				callC := common.InsnC(call)
+				ra := base + int(callA)
+				nparams := int(callB) - 1
+				nresults := int(callC) - 1
+				if callB == 0 {
+					nparams = L.top - ra - 1
+				}
+				// Only the builtin's "safeenv" path; we treat all
+				// envs as safe here (sandbox enforcement is on writes,
+				// not reads, and the global table is shared).
+				if nparams >= 1 && cl.env.safeenv {
+					arg0 := L.stack[ra+1]
+					// Gather additional args from ra+2..ra+nparams.
+					var argsBuf [8]value
+					var args []value
+					if nparams-1 > 0 {
+						if nparams-1 <= len(argsBuf) {
+							args = argsBuf[:nparams-1]
+						} else {
+							args = make([]value, nparams-1)
+						}
+						for i := 0; i < nparams-1; i++ {
+							args[i] = L.stack[ra+2+i]
+						}
+					}
+					ci.savedpc = pc
+					if n, ok := dispatchFastcall(L, bfid, ra, arg0, args, nresults, nparams); ok {
+						// Adjust L.top for MULTRET; otherwise leave
+						// it to the CALL convention.
+						if nresults == MultRet {
+							L.top = ra + n
+							if L.top > len(L.stack) {
+								L.reserve(L.top - len(L.stack))
+							}
+							L.stack = L.stack[:L.top]
+						} else {
+							// Pad results with nil up to nresults.
+							for i := n; i < nresults; i++ {
+								if ra+i >= len(L.stack) {
+									L.reserve(ra + i + 1 - L.top)
+								}
+								L.stack[ra+i] = nilValue()
+							}
+						}
+						// Skip past the CALL.
+						pc += skip + 1
+						continue
+					}
+				}
+				// Fall back: let the next CALL handle it.
+
+			case common.OpFastCall1:
+				bfid := common.Builtin(a)
+				b := common.InsnB(insn)
+				skip := int(common.InsnC(insn))
+				if pc+skip >= len(code) {
+					L.runtimeError("FASTCALL1: skip past end of code")
+				}
+				call := code[pc+skip]
+				if common.InsnOp(call) != common.OpCall {
+					L.runtimeError("FASTCALL1: following insn is not CALL")
+				}
+				callA := common.InsnA(call)
+				callC := common.InsnC(call)
+				ra := base + int(callA)
+				nresults := int(callC) - 1
+				if cl.env.safeenv {
+					arg0 := L.stack[base+int(b)]
+					ci.savedpc = pc
+					if n, ok := dispatchFastcall(L, bfid, ra, arg0, nil, nresults, 1); ok {
+						if nresults == MultRet {
+							L.top = ra + n
+							if L.top > len(L.stack) {
+								L.reserve(L.top - len(L.stack))
+							}
+							L.stack = L.stack[:L.top]
+						} else {
+							for i := n; i < nresults; i++ {
+								if ra+i >= len(L.stack) {
+									L.reserve(ra + i + 1 - L.top)
+								}
+								L.stack[ra+i] = nilValue()
+							}
+						}
+						pc += skip + 1
+						continue
+					}
+				}
+
+			case common.OpFastCall2:
+				bfid := common.Builtin(a)
+				b := common.InsnB(insn)
+				skip := int(common.InsnC(insn)) - 1
+				aux := code[pc]
+				pc++
+				if pc+skip >= len(code) {
+					L.runtimeError("FASTCALL2: skip past end of code")
+				}
+				call := code[pc+skip]
+				if common.InsnOp(call) != common.OpCall {
+					L.runtimeError("FASTCALL2: following insn is not CALL")
+				}
+				callA := common.InsnA(call)
+				callC := common.InsnC(call)
+				ra := base + int(callA)
+				nresults := int(callC) - 1
+				if cl.env.safeenv {
+					arg0 := L.stack[base+int(b)]
+					args := [...]value{L.stack[base+int(aux&0xff)]}
+					ci.savedpc = pc
+					if n, ok := dispatchFastcall(L, bfid, ra, arg0, args[:], nresults, 2); ok {
+						if nresults == MultRet {
+							L.top = ra + n
+							if L.top > len(L.stack) {
+								L.reserve(L.top - len(L.stack))
+							}
+							L.stack = L.stack[:L.top]
+						} else {
+							for i := n; i < nresults; i++ {
+								if ra+i >= len(L.stack) {
+									L.reserve(ra + i + 1 - L.top)
+								}
+								L.stack[ra+i] = nilValue()
+							}
+						}
+						pc += skip + 1
+						continue
+					}
+				}
+
+			case common.OpFastCall2K:
+				bfid := common.Builtin(a)
+				b := common.InsnB(insn)
+				skip := int(common.InsnC(insn)) - 1
+				aux := code[pc]
+				pc++
+				if pc+skip >= len(code) {
+					L.runtimeError("FASTCALL2K: skip past end of code")
+				}
+				call := code[pc+skip]
+				if common.InsnOp(call) != common.OpCall {
+					L.runtimeError("FASTCALL2K: following insn is not CALL")
+				}
+				callA := common.InsnA(call)
+				callC := common.InsnC(call)
+				ra := base + int(callA)
+				nresults := int(callC) - 1
+				if cl.env.safeenv {
+					if int(aux) >= len(constants) {
+						L.runtimeError("FASTCALL2K: constant index out of range")
+					}
+					arg0 := L.stack[base+int(b)]
+					args := [...]value{constants[aux]}
+					ci.savedpc = pc
+					if n, ok := dispatchFastcall(L, bfid, ra, arg0, args[:], nresults, 2); ok {
+						if nresults == MultRet {
+							L.top = ra + n
+							if L.top > len(L.stack) {
+								L.reserve(L.top - len(L.stack))
+							}
+							L.stack = L.stack[:L.top]
+						} else {
+							for i := n; i < nresults; i++ {
+								if ra+i >= len(L.stack) {
+									L.reserve(ra + i + 1 - L.top)
+								}
+								L.stack[ra+i] = nilValue()
+							}
+						}
+						pc += skip + 1
+						continue
+					}
+				}
+
+			case common.OpFastCall3:
+				bfid := common.Builtin(a)
+				b := common.InsnB(insn)
+				skip := int(common.InsnC(insn)) - 1
+				aux := code[pc]
+				pc++
+				if pc+skip >= len(code) {
+					L.runtimeError("FASTCALL3: skip past end of code")
+				}
+				call := code[pc+skip]
+				if common.InsnOp(call) != common.OpCall {
+					L.runtimeError("FASTCALL3: following insn is not CALL")
+				}
+				callA := common.InsnA(call)
+				callC := common.InsnC(call)
+				ra := base + int(callA)
+				nresults := int(callC) - 1
+				if cl.env.safeenv {
+					arg0 := L.stack[base+int(b)]
+					argA := common.InsnAuxA(aux)
+					argB := common.InsnAuxB(aux)
+					args := [...]value{
+						L.stack[base+int(argA)],
+						L.stack[base+int(argB)],
+					}
+					ci.savedpc = pc
+					if n, ok := dispatchFastcall(L, bfid, ra, arg0, args[:], nresults, 3); ok {
+						if nresults == MultRet {
+							L.top = ra + n
+							if L.top > len(L.stack) {
+								L.reserve(L.top - len(L.stack))
+							}
+							L.stack = L.stack[:L.top]
+						} else {
+							for i := n; i < nresults; i++ {
+								if ra+i >= len(L.stack) {
+									L.reserve(ra + i + 1 - L.top)
+								}
+								L.stack[ra+i] = nilValue()
+							}
+						}
+						pc += skip + 1
+						continue
+					}
+				}
 
 			case common.OpCoverage:
 				// Coverage hit; just count by patching the instruction's E field.
@@ -887,14 +1146,28 @@ func indexValue(L *stateImpl, t, k value) value {
 }
 
 func (L *stateImpl) callIndexMeta(mm, t, k value) value {
-	base := L.top
+	// Metamethod calls must allocate ABOVE the caller's used
+	// registers; otherwise the argument area overlaps the still-live
+	// registers of the surrounding opcode (e.g. the LOADK /
+	// GETGLOBAL slots that a CALL is about to consume).
+	base := metamethodBase(L, L.top)
+	savedTop := L.top
+	savedLen := len(L.stack)
+	if base > L.top {
+		if needLen := base + 3; needLen > len(L.stack) {
+			L.reserve(needLen - L.top)
+		}
+		L.top = base
+	}
 	L.push(mm)
 	L.push(t)
 	L.push(k)
 	L.callValue(base, 2, 1)
 	r := L.stack[base]
-	L.stack = L.stack[:base]
-	L.top = base
+	if savedLen > L.top {
+		L.stack = L.stack[:savedLen]
+	}
+	L.top = savedTop
 	return r
 }
 
@@ -930,12 +1203,24 @@ func newIndexValue(L *stateImpl, t, k, v value) {
 			L.runtimeError("attempt to index a " + t.tag.String() + " value")
 		}
 		if mm.tag == TFunction {
-			base := L.top
+			base := metamethodBase(L, L.top)
+			savedTop := L.top
+			savedLen := len(L.stack)
+			if base > L.top {
+				if needLen := base + 4; needLen > len(L.stack) {
+					L.reserve(needLen - L.top)
+				}
+				L.top = base
+			}
 			L.push(mm)
 			L.push(t)
 			L.push(k)
 			L.push(v)
 			L.callValue(base, 3, 0)
+			if savedLen > L.top {
+				L.stack = L.stack[:savedLen]
+			}
+			L.top = savedTop
 			return
 		}
 		t = mm
