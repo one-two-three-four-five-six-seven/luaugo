@@ -705,10 +705,17 @@ func basePCall(s *vm.State) int {
 
 func baseXPCall(s *vm.State) int {
 	if s.Top() < 2 {
-		s.LError("missing arguments to 'xpcall'")
+		// Match upstream lbaselib.cpp::luaB_xpcall message exactly so
+		// pcall.luau:120 ("missing argument #2 to 'xpcall' (function
+		// expected)") matches.
+		s.LError("missing argument #2 to 'xpcall' (function expected)")
 	}
 	if s.Type(2) != vm.TFunction {
-		s.LError("bad argument #2 to 'xpcall' (function expected)")
+		// Upstream Luau distinguishes "missing" from "wrong-typed"
+		// argument #2; conformance fixture pcall.luau:121 matches
+		// the latter exactly. Use luaL_typeerrorL-shape message.
+		got := s.Type(2).String()
+		s.LError("invalid argument #2 to 'xpcall' (function expected, got %s)", got)
 	}
 	// Swap idx 1 (f) and idx 2 (handler) so the handler can be used
 	// as PCall's errfunc at the absolute stack position of rel idx 1.
@@ -718,6 +725,24 @@ func baseXPCall(s *vm.State) int {
 	s.Replace(2)   // h, f, args
 	nargs := s.Top() - 2
 	st := s.PCall(nargs, vm.MultRet, 1)
+	// On any non-OK status, normalise the stack so that exactly one
+	// error value remains, matching upstream lua_pcall's contract.
+	// luaugo's pkg/vm/do.go currently leaves extra frame state on
+	// the stack when an err handler itself errors (StatusErrErr);
+	// clean that up here and synthesise the upstream-canonical
+	// "error in error handling" string for the ErrErr case.
+	if st != vm.StatusOK {
+		// The error value lives at slot 2 (the original function
+		// slot, which pcallFromGo overwrites). Anything past slot 2
+		// is leaked frame state from a failed errfunc call.
+		if st == vm.StatusErrErr {
+			s.SetTop(2)
+			s.PushString("error in error handling")
+			s.Replace(2)
+		} else {
+			s.SetTop(2)
+		}
+	}
 	// Replace the handler slot with the boolean status.
 	s.PushBoolean(st == vm.StatusOK)
 	s.Replace(1)
