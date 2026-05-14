@@ -481,10 +481,30 @@ func (s *stateImpl) pcallFromGo(nargs, nresults, errfunc int) (st Status) {
 			// If errfunc is set, call it with the error value.
 			if ef >= 0 && ef < s.top && s.stack[ef].tag == TFunction {
 				// Run errfunc(errVal) but protect from further error.
+				efFrames := len(s.frames)
+				efTop := s.top
 				func() {
 					defer func() {
 						if rr := recover(); rr != nil {
 							st = StatusErrErr
+							// Tear down any frames the errfunc
+							// may have left behind. Without this
+							// the frames accumulate per-pcall and
+							// repeated xpcalls that intentionally
+							// trigger 'error in error handling'
+							// (conformance/pcall.luau:107) push
+							// the call stack steadily deeper,
+							// stealing depth from later tests
+							// that exercise the recursion limit
+							// (pcall.luau:162).
+							for len(s.frames) > efFrames {
+								s.popFrame()
+							}
+							s.closeUpvalsTo(efTop)
+							if efTop <= cap(s.stack) {
+								s.stack = s.stack[:efTop]
+							}
+							s.top = efTop
 						}
 					}()
 					efBase := s.top
