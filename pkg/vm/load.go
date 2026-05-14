@@ -7,6 +7,7 @@ package vm
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
@@ -182,9 +183,19 @@ func newProtoCache() *protoCache {
 
 // getProtoCache returns g's proto cache, creating it lazily. We attach
 // it to the globalState via a side map keyed on the global pointer.
-var pcaches = map[*globalState]*protoCache{}
+// The lookup must be safe for concurrent callers because coroutines
+// (each its own goroutine) can race on the first cache miss, even
+// though the VM mutex serialises Lua-level execution. The mutex is
+// scoped to the map operation itself; we do not hold it across any
+// computation.
+var (
+	pcachesMu sync.Mutex
+	pcaches   = map[*globalState]*protoCache{}
+)
 
 func getProtoCache(g *globalState) *protoCache {
+	pcachesMu.Lock()
+	defer pcachesMu.Unlock()
 	if c, ok := pcaches[g]; ok {
 		return c
 	}
