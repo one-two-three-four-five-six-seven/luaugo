@@ -34,39 +34,35 @@ Updated by the orchestrator at the start of each swarm. Empty when no
 swarm is running.
 
 ```
-swarm: bug-fix-batch-3 (active)
-baseline: master @ 9f06895
-agents:
-  - fix-shims:
-      target: register conformance-harness shim globals so the
-              "attempt to call a nil value" cluster (buffers,
-              coverage, debugger, integers_regspill, native,
-              native_userdata, udata_direct, userdata) progresses
-      worktree: .swarm/fix-shims
-      owned:
-        - tests/conformance_shims.go (NEW)
-        - tests/luaugo_vm_suite_test.go
-        - pkg/vm/lib/conformance_shims_test.go (NEW)
-  - fix-tables-vector:
-      target: tables.luau (table.insert arg check) + vector.luau
-              (Magnitude/Unit property access)
-      worktree: .swarm/fix-tables-vector
-      owned:
-        - pkg/vm/lib/table.go
-        - pkg/vm/lib/vector.go
-        - pkg/vm/lib/tables_insert_test.go (NEW)
-        - pkg/vm/lib/vector_index_test.go (NEW)
-        - pkg/vm/execute.go
-  - fix-closure-timeout:
-      target: closure.luau no longer TIMEOUT
-      worktree: .swarm/fix-closure-timeout
-      owned:
-        - pkg/vm/closure.go
-        - pkg/vm/do.go
-        - pkg/vm/closure_loop_test.go (NEW)
+swarm: (none active)
+baseline: (n/a)
+agents: []
 ```
 
 ## Recent swarm history
+
+### bug-fix-batch-4 (completed at master @ 0fc6bd2)
+
+baseline: master @ 6a3fbc2
+
+| agent | target | files changed | outcome |
+|---|---|---|---|
+| fix-basic-compiler | basic.luau:188 numeric-for layout | pkg/compiler/compiler.go + new test | Real bug fixed (3-reg -> 4-reg layout). Fixture advances to line 250 (next bug). |
+| fix-events-arith | events.luau:475 | pkg/vm/execute.go (out-of-scope but kept) + new test | Real bug fixed (GETGLOBAL/SETGLOBAL/GETIMPORT now invoke __index/__newindex). Fixture advances to line 487. |
+| fix-pcall-redo | pcall.luau:8 + errors.luau:198 | pkg/vm/lib/{base,debug}.go + new tests | debug.info(C-fn,"s")="[C]" fixed; xpcall traceback format fixed. Fixtures advance to lines 129 / 192. |
+
+Net: 30/53 -> 30/53 (deep-bug fixes; fixtures hit secondary issues).
+Zero conflicts.
+
+### bug-fix-batch-3 (completed at master @ 6a3fbc2)
+
+baseline: master @ 9f06895
+
+| agent | target | files changed | outcome |
+|---|---|---|---|
+| fix-shims | conformance-harness globals | tests/conformance_shims.go (NEW) + new tests | +2 fixtures (buffers, debugger). |
+| fix-tables-vector | tables.luau + vector.luau | pkg/vm/lib/{table,vector}.go + tests | Real bugs fixed; fixtures advance. |
+| fix-closure-timeout | closure.luau TIMEOUT | new diagnostic test only | Diagnostic; root cause in thread.go (outside scope). Orchestrator applied 16-line fix directly post-swarm: 29 -> 30. |
 
 ### bug-fix-batch-2 (completed at master @ 0fa87d0)
 
