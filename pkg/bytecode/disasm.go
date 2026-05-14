@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/luaugo/luaugo/internal/common"
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
 )
 
 // disassemble renders the full Module in a human-readable form: each

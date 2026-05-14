@@ -10,7 +10,7 @@
 // upstream sources of truth.
 package vm
 
-import "github.com/luaugo/luaugo/pkg/bytecode"
+import "github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 
 // ----------------------------------------------------------------------
 // Type tags

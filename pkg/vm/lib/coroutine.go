@@ -14,7 +14,7 @@
 // once this file is integrated.
 package lib
 
-import "github.com/luaugo/luaugo/pkg/vm"
+import "github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 
 // openCoroutineImpl registers the `coroutine` global table and its
 // functions. Mirrors upstream luaopen_coroutine.

@@ -8,7 +8,7 @@ package lib
 import (
 	"strings"
 
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // table.go: Luau `table` standard library. Mirrors upstream

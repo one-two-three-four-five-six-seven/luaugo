@@ -8,7 +8,7 @@ package lib
 import (
 	"math"
 
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // vector.go implements Luau's `vector` library, mirroring upstream

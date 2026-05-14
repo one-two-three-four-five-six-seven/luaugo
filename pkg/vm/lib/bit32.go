@@ -9,7 +9,7 @@ import (
 	"math"
 	"math/bits"
 
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // bit32.go: Tier-4 implementation of the bit32 standard library.

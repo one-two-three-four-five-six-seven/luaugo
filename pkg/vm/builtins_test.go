@@ -8,8 +8,8 @@ package vm
 import (
 	"testing"
 
-	"github.com/luaugo/luaugo/internal/common"
-	"github.com/luaugo/luaugo/pkg/bytecode"
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
 
 // fastcallSandbox ensures the global env is safeenv so the FASTCALL

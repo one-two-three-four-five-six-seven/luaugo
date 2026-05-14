@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // math.go: Luau standard math library. Ports upstream lmathlib.cpp

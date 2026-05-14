@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // startTime is the wall-clock instant at which the process started.

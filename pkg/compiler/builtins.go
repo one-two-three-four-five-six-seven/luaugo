@@ -4,7 +4,7 @@
 
 package compiler
 
-import "github.com/luaugo/luaugo/internal/common"
+import "github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
 
 // builtins.go maps function names like "math.abs" to common.Builtin ids
 // used by FASTCALL opcodes. The current compiler does NOT emit FASTCALL

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luaugo/luaugo/internal/upstreamvm"
-	"github.com/luaugo/luaugo/pkg/compiler"
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/upstreamvm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/compiler"
 )
 
 const demoSource = `

@@ -8,7 +8,7 @@ package vm
 import (
 	"math"
 
-	"github.com/luaugo/luaugo/internal/common"
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
 )
 
 // builtins.go: fast-path implementations of FASTCALL builtins.

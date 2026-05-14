@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luaugo/luaugo/pkg/compiler"
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/compiler"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // newUTF8State spins up a fresh VM with only the utf8 library opened.

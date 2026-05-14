@@ -6,7 +6,7 @@
 package lib
 
 import (
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // utf8.go: implementation of Luau's `utf8` standard library, mirroring

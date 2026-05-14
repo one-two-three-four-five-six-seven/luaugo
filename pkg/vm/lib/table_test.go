@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luaugo/luaugo/pkg/compiler"
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/compiler"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // runLuau compiles src as a Luau chunk and runs it with the base and

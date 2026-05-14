@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luaugo/luaugo/pkg/compiler"
-	"github.com/luaugo/luaugo/pkg/vm"
-	"github.com/luaugo/luaugo/pkg/vm/lib"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/compiler"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm/lib"
 )
 
 // newCoroutineState returns a fresh State with the base and coroutine

@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/luaugo/luaugo/internal/common"
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
 )
 
 // encode serializes a Module to the upstream Luau bytecode binary

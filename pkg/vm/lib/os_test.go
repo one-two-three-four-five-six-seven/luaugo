@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/luaugo/luaugo/pkg/compiler"
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/compiler"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // osRunLua compiles and runs `source` against s, expecting `nresults`

@@ -9,7 +9,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // newVecState returns a fresh VM with the vector library opened.

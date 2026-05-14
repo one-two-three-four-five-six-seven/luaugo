@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // base.go implements Luau's base library (the global functions:

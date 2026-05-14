@@ -5,7 +5,7 @@
 
 package vm
 
-import "github.com/luaugo/luaugo/pkg/bytecode"
+import "github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 
 // closure mirrors upstream Closure (lobject.h). A single Go struct
 // represents both Lua and Go ("C") closures distinguished by the isGo

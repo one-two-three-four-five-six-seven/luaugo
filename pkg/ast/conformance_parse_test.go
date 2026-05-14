@@ -18,7 +18,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luaugo/luaugo/pkg/ast"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/ast"
 )
 
 // knownFailing documents fixtures that legitimately fail to parse,

@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/luaugo/luaugo/internal/common"
-	"github.com/luaugo/luaugo/pkg/bytecode"
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
 
 // builder accumulates instructions and constants for a single proto and

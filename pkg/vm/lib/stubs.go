@@ -2,7 +2,7 @@
 
 package lib
 
-import "github.com/luaugo/luaugo/pkg/vm"
+import "github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 
 // stubs.go: declarations for Open* helpers whose dedicated file has
 // not yet landed in the parallel Tier-4 stdlib swarm. Each landing

@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luaugo/luaugo/pkg/compiler"
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/compiler"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // runBaseLuau compiles src and runs it on a fresh VM with OpenBase

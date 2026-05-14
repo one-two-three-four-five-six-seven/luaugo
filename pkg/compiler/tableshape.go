@@ -4,7 +4,7 @@
 
 package compiler
 
-import "github.com/luaugo/luaugo/pkg/ast"
+import "github.com/one-two-three-four-five-six-seven/luaugo/pkg/ast"
 
 // tableshape.go ports the table-shape detection from
 // Compiler/src/TableShape.cpp.

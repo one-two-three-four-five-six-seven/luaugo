@@ -11,8 +11,8 @@
 package compiler
 
 import (
-	"github.com/luaugo/luaugo/pkg/ast"
-	"github.com/luaugo/luaugo/pkg/bytecode"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/ast"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
 
 // OptimizationLevel selects the compiler's optimization preset. Values

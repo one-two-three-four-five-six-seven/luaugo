@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/luaugo/luaugo/pkg/compiler"
-	"github.com/luaugo/luaugo/pkg/vm"
-	"github.com/luaugo/luaugo/pkg/vm/lib"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/compiler"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm/lib"
 )
 
 // runScript compiles src as a chunk and runs it on a fresh State with

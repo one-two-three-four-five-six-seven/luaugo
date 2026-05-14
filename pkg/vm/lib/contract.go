@@ -10,7 +10,7 @@
 // from luaL_openlibs / linit.cpp.
 package lib
 
-import "github.com/luaugo/luaugo/pkg/vm"
+import "github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 
 // OpenAll opens every standard library on s. It is the equivalent of
 // upstream luaL_openlibs / linit.cpp's set of openlib calls.

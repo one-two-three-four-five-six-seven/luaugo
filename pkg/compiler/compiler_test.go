@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luaugo/luaugo/internal/upstreamvm"
-	"github.com/luaugo/luaugo/pkg/bytecode"
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/upstreamvm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
 
 // compileAndEncode is a test helper: compile source → encode → return blob.

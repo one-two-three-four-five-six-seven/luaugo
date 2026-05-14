@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/luaugo/luaugo/pkg/vm"
-	"github.com/luaugo/luaugo/pkg/vm/lib"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm/lib"
 )
 
 // These tests drive the buffer standard library end-to-end through the

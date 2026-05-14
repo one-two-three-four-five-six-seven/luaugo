@@ -9,7 +9,7 @@ import (
 	"encoding/binary"
 	"math"
 
-	"github.com/luaugo/luaugo/pkg/vm"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
 // buffer.go: Luau's `buffer` standard library. Mirrors upstream

@@ -8,7 +8,7 @@ package vm
 import (
 	"fmt"
 
-	"github.com/luaugo/luaugo/pkg/bytecode"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
 
 // api.go: Tier-3 implementations of *State methods. These functions

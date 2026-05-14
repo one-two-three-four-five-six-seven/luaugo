@@ -13,7 +13,7 @@
 // upstream sources of truth (Bytecode.h, BytecodeBuilder.cpp, lvmload.cpp).
 package bytecode
 
-import "github.com/luaugo/luaugo/internal/common"
+import "github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
 
 // ----------------------------------------------------------------------
 // In-memory Proto representation

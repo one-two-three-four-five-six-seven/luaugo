@@ -5,7 +5,7 @@
 
 package lib
 
-import "github.com/luaugo/luaugo/pkg/vm"
+import "github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 
 // debug.go implements Luau's debug library. Mirrors upstream
 // .upstream/VM/src/ldblib.cpp. Luau's debug library is deliberately

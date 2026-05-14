@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/luaugo/luaugo/pkg/bytecode"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
 
 // debug.go: traceback and debug.info support. Mirrors the

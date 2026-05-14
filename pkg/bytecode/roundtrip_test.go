@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/luaugo/luaugo/internal/common"
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
 )
 
 // buildSampleModule constructs a minimal Module that exercises the

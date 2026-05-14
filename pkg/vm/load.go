@@ -8,7 +8,7 @@ package vm
 import (
 	"fmt"
 
-	"github.com/luaugo/luaugo/pkg/bytecode"
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
 
 // load.go: bytecode loading. Mirrors upstream lvmload.cpp luau_load.
