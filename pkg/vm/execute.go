@@ -665,12 +665,52 @@ func executeProto(L *stateImpl, ci *callInfo) {
 			case common.OpDupTable:
 				d := common.InsnD(insn)
 				kv := constants[d]
+				// Compile-time table shape: pre-create the declared
+				// keys (with nil values) in source order so that
+				// subsequent SETTABLEKS assignments land in the
+				// same bucket positions and pairs() iteration
+				// matches source order. Mirrors upstream luaH_clone
+				// (VM/src/ltable.cpp:854) of a constant table
+				// built at decode time.
+				//
+				// We size the hash part to fit all template keys
+				// so set() doesn't need to rehash during the
+				// SETTABLEKS sequence; that would otherwise move
+				// keys around and lose the source-order invariant.
 				t := newTable(L.gs, 0, 0)
 				if kv.tag == TLightUserdata {
 					switch tag := kv.ptr.(type) {
 					case tableTemplateTag:
-						// Pre-create slots for each declared key.
-						_ = tag
+						nKeys := len(tag.keys)
+						if nKeys == 0 {
+							nKeys = len(tag.pairs)
+						}
+						if nKeys > 0 {
+							// Pre-size the hash to fit all keys
+							// without rehash, then insert in
+							// source order with nil values.
+							t.setNodeVector(nKeys)
+							for _, ki := range tag.keys {
+								if int(ki) < len(constants) {
+									k := constants[ki]
+									if k.tag != TNil {
+										t.set(L.gs, k, nilValue())
+									}
+								}
+							}
+							for _, p := range tag.pairs {
+								if int(p.Key) < len(constants) {
+									k := constants[p.Key]
+									if k.tag != TNil {
+										var v value
+										if int(p.Value) < len(constants) {
+											v = constants[p.Value]
+										}
+										t.set(L.gs, k, v)
+									}
+								}
+							}
+						}
 					}
 				}
 				L.stack[base+int(a)] = tableValue(t)
