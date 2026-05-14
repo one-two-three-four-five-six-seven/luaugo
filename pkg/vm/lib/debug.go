@@ -102,18 +102,14 @@ func debugInfo(s *vm.State) int {
 		if !ok {
 			return 0
 		}
-	} else {
-		// First, see if the function value happens to also be on the
-		// call stack (e.g. self-recursive call). If so, promote to
-		// the level-form so we get current-line and source info.
-		if frameLevel, ok := frameLevelForFunction(s, fnIdx); ok {
-			if di, ok2 := s.GetInfo(frameLevel); ok2 {
-				info = di
-				fnIdx = 0
-				level = frameLevel
-			}
-		}
 	}
+	// For the function-form (fnIdx != 0) we deliberately do NOT
+	// promote to the level-form even when the function is also on
+	// the live call stack: upstream semantics distinguish "info for
+	// a function value" (linedefined, source, numparams) from "info
+	// for a frame" (current line, what). conformance/debug.luau:109
+	// runs `debug.info(testlinedefined, "l")` from inside
+	// testlinedefined and expects LineDefined, not Currentline.
 
 	var occurs [26]bool
 	results := 0
