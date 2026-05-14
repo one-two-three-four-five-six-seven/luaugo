@@ -57,6 +57,35 @@ func TestLuaugoVMSuite(t *testing.T) {
 		Elapsed time.Duration
 	}
 
+	// skipFixtures mirrors upstream's TEST_CASE gating: fixtures that
+	// upstream itself only runs when specific feature flags are on or
+	// when native codegen is enabled. luaugo is a pure-VM port with no
+	// native codegen and does not implement the experimental integer
+	// type, so these tests are structurally inapplicable; reporting
+	// them as failures would be misleading. The justification per
+	// fixture is documented inline below and mirrors the upstream
+	// gating in tests/Conformance.test.cpp.
+	skipFixtures := map[string]string{
+		// Conformance.test.cpp:1214 gates "integers.luau" behind
+		// FFlag::LuauIntegerType && FFlag::LuauIntegerLibrary. These
+		// flags introduce a separate TInteger value tag and an
+		// `integer` global library; both are experimental and not
+		// present in the stable Luau VM that luaugo targets.
+		"integers.luau": "upstream gate: FFlag::LuauIntegerType && FFlag::LuauIntegerLibrary (experimental integer value type)",
+		// Conformance.test.cpp:1224 additionally gates
+		// "integers_regspill.luau" behind `codegen &&
+		// luau_codegen_supported()` -- it depends on the native
+		// codegen register-spill path, which luaugo does not have.
+		"integers_regspill.luau": "upstream gate: FFlag::LuauIntegerType + native codegen (register spill paths)",
+		// Conformance.test.cpp:3866 gates "native_types.luau" behind
+		// `codegen && luau_codegen_supported()`, with the comment
+		// "This tests requires code to run natively, otherwise all
+		// 'is_native' checks will fail". The test asserts on runtime
+		// type guards emitted by the native code generator on
+		// function entry; luaugo's interpreter has no such guards.
+		"native_types.luau": "upstream gate: codegen && luau_codegen_supported() (native entry type guards)",
+	}
+
 	var results []outcome
 
 	for _, e := range entries {
@@ -65,6 +94,10 @@ func TestLuaugoVMSuite(t *testing.T) {
 		}
 		name := e.Name()
 		if !(strings.HasSuffix(name, ".lua") || strings.HasSuffix(name, ".luau")) {
+			continue
+		}
+		if reason, ok := skipFixtures[name]; ok {
+			results = append(results, outcome{Name: name, Status: "SKIP", Detail: reason})
 			continue
 		}
 		src, err := os.ReadFile(filepath.Join(conformDir, name))
@@ -98,7 +131,7 @@ func TestLuaugoVMSuite(t *testing.T) {
 	sort.Slice(results, func(i, j int) bool { return results[i].Name < results[j].Name })
 
 	// Report.
-	var compileOK, loadOK, runOK, panics, timeouts int
+	var compileOK, loadOK, runOK, panics, timeouts, skipped int
 	t.Logf("")
 	t.Logf("luaugo compiler + luaugo VM, per conformance fixture")
 	t.Logf("--------------------------------------------------------------------------")
@@ -123,6 +156,8 @@ func TestLuaugoVMSuite(t *testing.T) {
 			compileOK++
 			loadOK++
 			timeouts++
+		case "SKIP":
+			skipped++
 		}
 		t.Logf("%-40s %-13s %6dms   %s",
 			truncate(oc.Name, 40),
@@ -130,20 +165,24 @@ func TestLuaugoVMSuite(t *testing.T) {
 			oc.Elapsed.Milliseconds(),
 			truncate(oc.Detail, 80))
 	}
+	// Denominators exclude SKIPs: those fixtures aren't applicable to
+	// our pure-VM runtime (see skipFixtures map above for upstream
+	// gating justification).
+	denom := len(results) - skipped
 	t.Logf("--------------------------------------------------------------------------")
-	t.Logf("totals: %d fixtures", len(results))
-	t.Logf("  compiled clean (luaugo compiler):                 %d / %d", compileOK, len(results))
-	t.Logf("  loaded clean   (luaugo VM):                       %d / %d", loadOK, len(results))
-	t.Logf("  main chunk ran to completion on luaugo VM:        %d / %d", runOK, len(results))
+	t.Logf("totals: %d fixtures (%d applicable, %d skipped as native-only / flagged)", len(results), denom, skipped)
+	t.Logf("  compiled clean (luaugo compiler):                 %d / %d", compileOK, denom)
+	t.Logf("  loaded clean   (luaugo VM):                       %d / %d", loadOK, denom)
+	t.Logf("  main chunk ran to completion on luaugo VM:        %d / %d", runOK, denom)
 	t.Logf("  goroutine panics during luaugo VM execution:      %d", panics)
 	t.Logf("  fixture timeouts (>5s):                           %d", timeouts)
 
-	// Gate: every fixture must at least compile and load on our own VM.
-	if compileOK < len(results) {
-		t.Errorf("luaugo compiler regressed: only %d / %d fixtures compiled", compileOK, len(results))
+	// Gate: every applicable fixture must at least compile and load.
+	if compileOK < denom {
+		t.Errorf("luaugo compiler regressed: only %d / %d applicable fixtures compiled", compileOK, denom)
 	}
-	if loadOK < len(results) {
-		t.Errorf("luaugo VM loader regressed: only %d / %d fixtures loaded", loadOK, len(results))
+	if loadOK < denom {
+		t.Errorf("luaugo VM loader regressed: only %d / %d applicable fixtures loaded", loadOK, denom)
 	}
 }
 
