@@ -186,6 +186,7 @@ func runOnLuaugoVM(name string, src []byte) (status, detail string) {
 	lib.Stdout = io.Discard
 
 	lib.OpenAll(s)
+	installConformanceShims(s)
 
 	if err := s.Load(name, blob, 0); err != nil {
 		return "LOAD_ERROR", err.Error()

@@ -34,9 +34,36 @@ Updated by the orchestrator at the start of each swarm. Empty when no
 swarm is running.
 
 ```
-swarm: (none active)
-baseline: (n/a)
-agents: []
+swarm: bug-fix-batch-3 (active)
+baseline: master @ 9f06895
+agents:
+  - fix-shims:
+      target: register conformance-harness shim globals so the
+              "attempt to call a nil value" cluster (buffers,
+              coverage, debugger, integers_regspill, native,
+              native_userdata, udata_direct, userdata) progresses
+      worktree: .swarm/fix-shims
+      owned:
+        - tests/conformance_shims.go (NEW)
+        - tests/luaugo_vm_suite_test.go
+        - pkg/vm/lib/conformance_shims_test.go (NEW)
+  - fix-tables-vector:
+      target: tables.luau (table.insert arg check) + vector.luau
+              (Magnitude/Unit property access)
+      worktree: .swarm/fix-tables-vector
+      owned:
+        - pkg/vm/lib/table.go
+        - pkg/vm/lib/vector.go
+        - pkg/vm/lib/tables_insert_test.go (NEW)
+        - pkg/vm/lib/vector_index_test.go (NEW)
+        - pkg/vm/execute.go
+  - fix-closure-timeout:
+      target: closure.luau no longer TIMEOUT
+      worktree: .swarm/fix-closure-timeout
+      owned:
+        - pkg/vm/closure.go
+        - pkg/vm/do.go
+        - pkg/vm/closure_loop_test.go (NEW)
 ```
 
 ## Recent swarm history
