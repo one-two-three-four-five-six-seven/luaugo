@@ -865,15 +865,40 @@ func (c *compiler) compileContinue(s *ast.StatContinue) {
 
 // compileFor handles numeric for: for v = init, limit[, step] do body end.
 //
-// Upstream uses a 3-register layout [limit, step, index]; the user-
-// visible loop variable shares the index register.
-// FORNPREP at A=base: checks types, computes initial values, jumps to end.
-// FORNLOOP at A=base: steps and jumps back to body.
+// Upstream Luau uses a 4-register layout for the numeric `for` loop:
+//
+//	R(A+0) = limit
+//	R(A+1) = step
+//	R(A+2) = internal index (VM-private; not a Lua local)
+//	R(A+3) = user-visible loop variable (the Lua local)
+//
+// FORNPREP at A=base:
+//   - coerces the three initial slots to numbers,
+//   - jumps to end if the loop is already complete.
+//
+// FORNLOOP at A=base:
+//   - adds R(A+1) to R(A+2) (the internal index),
+//   - if still within [limit] (per sign of step), copies the updated
+//     index into R(A+3) and jumps back to the body.
+//
+// Upstream seeds R(A+3) for the first iteration not via the VM but via
+// a MOVE A+3, A+2 emitted at the top of the body. We mirror that
+// pattern below: emit a MOVE immediately after FORNPREP so the body
+// always sees a valid user-visible variable, regardless of whether the
+// current iteration is the first (entered via FORNPREP) or a
+// continuation (entered via the back-edge from FORNLOOP).
+//
+// This split is what makes assignments to the loop variable inside the
+// body safe: the body sees the user-visible `R(A+3)` while the VM's
+// canonical counter lives in `R(A+2)`. Our previous emitter folded the
+// counter and the user variable into one slot (`base+2`), so user code
+// like `for b=9,1,-2 do ... b = nil end` could clobber the counter and
+// terminate the loop early (basic.luau:188).
 func (c *compiler) compileFor(s *ast.StatFor) {
 	fc := c.cur()
-	base := fc.pb.reserveReg(3) // limit, step, index/var
+	base := fc.pb.reserveReg(4) // limit, step, index, var
 
-	// Compile init into base+2 (index).
+	// Compile init into base+2 (internal index).
 	c.compileExprToReg(s.From, base+2)
 	// Compile limit into base+0.
 	c.compileExprToReg(s.To, base)
@@ -884,13 +909,24 @@ func (c *compiler) compileFor(s *ast.StatFor) {
 		fc.pb.emitAD(common.OpLoadN, base+1, 1)
 	}
 
-	// FORNPREP: A=base, D=jump-to-end.
+	// FORNPREP: A=base, D=jump-to-end. The VM also seeds R(A+3) with
+	// the validated initial index, so on entry to the body the
+	// user-visible variable is already populated.
 	prepPC := fc.pb.pc()
 	fc.pb.emitAD(common.OpForNPrep, base, 0)
 
 	bodyPC := fc.pb.pc()
-	// Bind the var to base+2 (shares index slot).
-	fc.locals[s.Var] = base + 2
+	// Seed the user-visible variable from the internal index for the
+	// first iteration. FORNLOOP handles this for subsequent iterations
+	// (it writes R(A+3) before taking the back-edge), but FORNPREP
+	// itself does not, so without this MOVE the body would see a
+	// stale slot on iteration 1.
+	fc.pb.emitABC(common.OpMove, base+3, base+2, 0)
+	// Bind the user-visible loop variable to base+3. The internal
+	// index at base+2 is NOT a Lua local: it has no entry in
+	// fc.locals, so name resolution for `b` (or any other identifier)
+	// can never reach it.
+	fc.locals[s.Var] = base + 3
 	fc.localStack = append(fc.localStack, s.Var)
 	fc.localScopeAt = append(fc.localScopeAt, fc.scopeDepth)
 
@@ -898,7 +934,11 @@ func (c *compiler) compileFor(s *ast.StatFor) {
 	loop := &loopCtx{
 		parent:        prevLoop,
 		localsAtEntry: len(fc.localStack),
-		closeReg:      base + 2,
+		// closeReg = base+3: the user-visible var is the only slot
+		// in this loop's layout that a closure can legitimately
+		// capture by name. The internal index at base+2 is invisible
+		// to source code, so no upvalue can be open at that level.
+		closeReg:      base + 3,
 		breakClose:    true,
 		continueClose: true,
 	}
@@ -906,14 +946,13 @@ func (c *compiler) compileFor(s *ast.StatFor) {
 
 	c.compileBlock(s.Body)
 
-	// Close any upvalues that captured the loop variable (base+2) or
-	// any other slot at or above it. Without this, when closures inside
-	// the body capture the index, they all share one upvalue across
-	// iterations -- breaking `for i=1,N do a[i]=function() return i end`.
-	// CLOSEUPVALS at A=base+2 is a no-op if no upvalue is open at that
-	// level, so it's safe to emit unconditionally for the back-edge.
+	// Close any upvalues that captured the loop variable. Without
+	// this, closures inside the body that capture `b` would all share
+	// one upvalue across iterations -- breaking
+	// `for i=1,N do a[i]=function() return i end`. CLOSEUPVALS at
+	// A=base+3 is a no-op if no upvalue is open at that level.
 	if !c.lastInsnIsUnreachableTerminator() {
-		fc.pb.emitABC(common.OpCloseUpvals, base+2, 0, 0)
+		fc.pb.emitABC(common.OpCloseUpvals, base+3, 0, 0)
 	}
 
 	// Patch continue jumps to the FORNLOOP.
