@@ -287,6 +287,13 @@ func baseSetMetatable(s *vm.State) int {
 	if s.LGetMetafield(1, "__metatable") {
 		s.LError("cannot change a protected metatable")
 	}
+	// Upstream rejects setmetatable on a frozen table:
+	// VM/src/lbaselib.cpp::luaB_setmetatable -> if (hvalue(t)->readonly)
+	// -> luaL_error "table is read-only". conformance/tables.luau:509
+	// `assert(not pcall(setmetatable, t, {}))` after table.freeze(t).
+	if s.GetReadonly(1) {
+		s.LError("attempt to modify a readonly table")
+	}
 	// SetMetatable expects the metatable on top of the stack.
 	s.SetTop(2)
 	if !s.SetMetatable(1) {

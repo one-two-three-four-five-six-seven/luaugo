@@ -674,22 +674,40 @@ func (t *table) resize(g *globalState, nasize, nhsize int) {
 // Length and iteration
 // ----------------------------------------------------------------------
 
-// rawLen returns the boundary index n such that t[n] != nil and
-// t[n+1] == nil (or 0 if t[1] is nil). Matches upstream luaH_getn.
+// rawLen returns a boundary index n such that t[n] != nil and
+// t[n+1] == nil (or 0 if t[1] is nil). Mirrors upstream luaH_getn
+// (VM/src/ltable.cpp:813), including its "branchless" binary search
+// from Khuong & Morin 2017 which biases toward the high end of the
+// array. The bias is observable to user code: with holes in the
+// array part, our previous lo/hi search converged to the LEFT-most
+// boundary while upstream converges to the right-most. The
+// conformance fixture tables.luau:534 builds a 10-wide array with a
+// hole at index 5 and asserts `#t == 9` after clearing index 10.
 func (t *table) rawLen() int {
 	j := len(t.array)
+
 	if j > 0 && t.array[j-1].tag == TNil {
-		// binary search for boundary in [0, j].
-		lo, hi := 0, j
-		for lo < hi {
-			mid := (lo + hi + 1) / 2
-			if t.array[mid-1].tag != TNil {
-				lo = mid
-			} else {
-				hi = mid - 1
+		// Branchless binary search. Start at offset 0, span j; at
+		// each step halve the span and shift base right past any
+		// non-nil midpoint. The final base+isNonNil(base[0]) is the
+		// boundary.
+		baseIdx := 0
+		rest := j
+		for {
+			half := rest >> 1
+			if half == 0 {
+				break
 			}
+			if t.array[baseIdx+half].tag != TNil {
+				baseIdx += half
+			}
+			rest -= half
 		}
-		return lo
+		boundary := baseIdx
+		if t.array[baseIdx].tag != TNil {
+			boundary++
+		}
+		return boundary
 	}
 	// If array is full, follow the hash part for any extension.
 	if len(t.nodes) == 0 {

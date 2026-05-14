@@ -177,9 +177,16 @@ func debugInfo(s *vm.State) int {
 					s.PushNil()
 				}
 			} else {
-				// Cross-thread function transfer not yet supported via
-				// the Tier-3 surface; push nil rather than crashing.
-				s.PushNil()
+				// Cross-thread: pull the target frame's closure
+				// value into our stack. Both States share a
+				// globalState (the target was created via
+				// coroutine.create on us), so the closure
+				// reference is safe to alias. conformance/
+				// debug.luau:40 needs this to satisfy
+				// `debug.info(co2, 0, "f") == halp`.
+				if !s.PushFuncFrom(target, level) {
+					s.PushNil()
+				}
 			}
 			results++
 
@@ -423,6 +430,52 @@ func debugTraceback(s *vm.State) int {
 			s.PushString(b.String())
 			return 1
 		}
+	}
+
+	// Cross-thread compact form, used when target is a different
+	// coroutine. Upstream luaL_traceback for a non-self thread emits
+	// "<chunk>:<line> function <name>\n" per Lua frame, with no
+	// "stack traceback:" header. conformance/debug.luau:38 hard-codes
+	// "debug.luau:31 function halp\n" for a one-frame yielded coroutine.
+	if target != s {
+		var b strings.Builder
+		if haveMsg {
+			b.WriteString(msg)
+			b.WriteByte('\n')
+		}
+		for level := int(level64); ; level++ {
+			info, ok := target.GetInfo(level)
+			if !ok {
+				break
+			}
+			if info.What == "Go" {
+				// Upstream's compact form does emit a "[C]" line
+				// for C frames, but our Go-frame info doesn't
+				// expose a usable name; mirror lua_debugtrace by
+				// emitting "[C] function ?" so callers can still
+				// see the frame exists.
+				b.WriteString("[C] function ?\n")
+				continue
+			}
+			src := info.Source
+			if src == "" {
+				src = "?"
+			}
+			b.WriteString(src)
+			if info.Currentline > 0 {
+				b.WriteByte(':')
+				b.WriteString(strconv.Itoa(info.Currentline))
+			}
+			b.WriteString(" function ")
+			name := info.Name
+			if name == "" {
+				name = "?"
+			}
+			b.WriteString(name)
+			b.WriteByte('\n')
+		}
+		s.PushString(b.String())
+		return 1
 	}
 
 	// Verbose / "Lua 5.x" form, retained for direct callers and the

@@ -84,8 +84,13 @@ func (s *State) GetInfo(level int) (DebugInfo, bool) {
 	}
 	if ci.cl.isGo {
 		di.What = "Go"
-		di.Source = "[Go]"
+		// Upstream lua_getinfo reports "[C]" for the source of C
+		// closures (luaO_chunkid of NULL); mirror it so debug.info
+		// "s" returns the upstream-canonical string and chained
+		// tests like debug.luau:66 `baz(0, "s") == "[C]"` pass.
+		di.Source = "[C]"
 		di.Currentline = -1
+		di.Name = ci.cl.debugName
 		return di, true
 	}
 	di.What = "Lua"
@@ -107,6 +112,34 @@ func (s *State) GetInfo(level int) (DebugInfo, bool) {
 // upstream lua_getinfo.
 func (s *State) PushFunc(level int) bool {
 	frames := s.impl.frames
+	idx := len(frames) - 1 - level
+	if idx < 0 || idx >= len(frames) {
+		return false
+	}
+	ci := frames[idx]
+	if ci.cl == nil {
+		s.impl.push(nilValue())
+		return true
+	}
+	s.impl.push(closureValue(ci.cl))
+	return true
+}
+
+// PushFuncFrom pushes the function value of the frame `level` deep
+// inside the source State `from` onto the receiver's stack. Returns
+// true if the frame exists. Cross-thread variant of PushFunc, needed
+// to implement debug.info(thread, level, "f") -- conformance/debug.luau
+// line 40 asserts debug.info(co2, 0, "f") == halp.
+//
+// Both States must belong to the same globalState (i.e. the receiver
+// was spawned via NewThread or coroutine.create on `from`); we do not
+// validate this here because all our existing call sites originate
+// from coroutine APIs that guarantee it.
+func (s *State) PushFuncFrom(from *State, level int) bool {
+	if from == nil {
+		return false
+	}
+	frames := from.impl.frames
 	idx := len(frames) - 1 - level
 	if idx < 0 || idx >= len(frames) {
 		return false

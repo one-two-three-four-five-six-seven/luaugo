@@ -428,7 +428,10 @@ func tableFind(s *vm.State) int {
 			s.Pop(1)
 			break
 		}
-		if s.RawEqual(2, -1) {
+		// Use Equal (not RawEqual) so __eq metamethods participate.
+		// conformance/tables.luau:454 builds a table of objects with
+		// custom __eq and asserts table.find honours it.
+		if s.Equal(2, -1) {
 			s.Pop(1)
 			s.PushInteger(int64(i))
 			return 1
