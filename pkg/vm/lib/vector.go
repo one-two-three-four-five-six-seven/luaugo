@@ -286,9 +286,87 @@ var vectorLib = []vm.LFnEntry{
 	{Name: "lerp", Fn: vectorLerp},
 }
 
+// vectorMethods maps Roblox-style PascalCase method names exposed via
+// vector __index and __namecall to their underlying implementations.
+// These are the same Go functions the lowercase `vector.<name>`
+// surface dispatches to: each implementation works equally well as a
+// free function or as a bound method because the first argument is
+// always the vector itself in both styles.
+//
+// Properties (Magnitude / Unit) are handled separately in
+// vectorIndex; they return computed values rather than functions.
+var vectorMethods = []vm.LFnEntry{
+	{Name: "Dot", Fn: vectorDot},
+	{Name: "Cross", Fn: vectorCross},
+	{Name: "Angle", Fn: vectorAngle},
+	{Name: "Floor", Fn: vectorFloor},
+	{Name: "Ceil", Fn: vectorCeil},
+	{Name: "Abs", Fn: vectorAbs},
+	{Name: "Sign", Fn: vectorSign},
+	{Name: "Clamp", Fn: vectorClamp},
+	{Name: "Max", Fn: vectorMax},
+	{Name: "Min", Fn: vectorMin},
+	{Name: "Lerp", Fn: vectorLerp},
+	{Name: "Normalize", Fn: vectorNormalize},
+}
+
+// vectorMethodsRegKey is the registry slot under which the
+// PascalCase vector method table is parked so vectorIndex can find it
+// without relying on closure upvalues (the public C-style API doesn't
+// expose lua_upvalueindex).
+const vectorMethodsRegKey = "luaugo.vector.methods"
+
+// vectorIndex implements __index for vector values. Upstream Luau
+// exposes Roblox-style properties (.Magnitude, .Unit) and methods
+// (:Dot, :Cross, ...) on every vector. Lowercase component selectors
+// (`.x`, `.y`, `.z`, `.w`) are short-circuited inside the VM by
+// vectorComponent before this metamethod is consulted, so we only
+// need to cover the Roblox surface here and raise on anything else.
+func vectorIndex(s *vm.State) int {
+	// args: 1 = vector, 2 = key
+	if s.Type(2) != vm.TString {
+		s.LError("attempt to index vector with a %s value", s.Type(2).String())
+	}
+	key, _ := s.ToString(2)
+	switch key {
+	case "Magnitude":
+		x, y, z := checkVector(s, 1)
+		m := float32(math.Sqrt(float64(x*x + y*y + z*z)))
+		s.PushNumber(float64(m))
+		return 1
+	case "Unit":
+		x, y, z := checkVector(s, 1)
+		mag := float32(math.Sqrt(float64(x*x + y*y + z*z)))
+		if mag == 0 {
+			pushVec3(s, 0, 0, 0)
+		} else {
+			inv := 1.0 / mag
+			pushVec3(s, x*inv, y*inv, z*inv)
+		}
+		return 1
+	}
+	// Method dispatch via the registry-cached method table.
+	s.GetRegistryField(vectorMethodsRegKey)
+	if s.Type(-1) == vm.TTable {
+		s.PushValue(2) // key
+		s.RawGet(-2)
+		if !s.IsNil(-1) {
+			return 1
+		}
+		s.Pop(2)
+	} else {
+		s.Pop(1)
+	}
+	s.LError("attempt to index vector with '%s'", key)
+	return 0
+}
+
 // openVector registers the `vector` global table on s. Mirrors upstream
-// luaopen_vector. The vector metatable (`__index` for component access)
-// is owned by the VM and is not touched here.
+// luaopen_vector and additionally installs the per-type metatable on
+// TVector so that scripts can use Roblox-style .Magnitude / .Unit
+// property access and :Dot() / :Cross() method calls. Lowercase
+// component selectors (`.x`, `.y`, `.z`, `.w`) are handled inside the
+// VM's indexValue fast path and bypass this metatable.
 func openVector(s *vm.State) {
 	s.CreateTable(0, len(vectorLib)+2)
 	s.LRegisterList(vectorLib)
@@ -301,4 +379,23 @@ func openVector(s *vm.State) {
 	s.SetField(-2, "one")
 
 	s.SetGlobal("vector")
+
+	// Per-type metatable for vectors.
+	// Build the PascalCase method table once and park it in the
+	// registry so vectorIndex can resolve method lookups without
+	// reconstructing closures on every access.
+	s.CreateTable(0, len(vectorMethods))
+	s.LRegisterList(vectorMethods)
+	s.SetRegistryField(vectorMethodsRegKey)
+
+	// Build the metatable: { __index = vectorIndex }.
+	s.NewTable()
+	s.PushGoFunction(vectorIndex, 0)
+	s.SetField(-2, "__index")
+
+	// Bind the metatable to TVector via SetMetatable on a vector value.
+	s.PushVector(0, 0, 0, 0)
+	s.Insert(-2)
+	s.SetMetatable(-2)
+	s.Pop(1) // pop the placeholder vector
 }

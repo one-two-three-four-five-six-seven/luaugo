@@ -6,6 +6,7 @@
 package lib
 
 import (
+	"math"
 	"strings"
 
 	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
@@ -182,7 +183,33 @@ func tableInsert(s *vm.State) int {
 		// Append.
 		s.RawSetI(1, n+1)
 	case 3:
-		pos := int(s.LCheckInteger(2))
+		// Upstream's table.insert accepts any numeric value for the
+		// position argument: whole-valued floats (`2.0`), arbitrary
+		// magnitudes, and even NaN. Our prior `LCheckInteger` was
+		// stricter than upstream because it rejects NaN (since NaN
+		// cannot represent an exact integer). The conformance fixture
+		// tables.luau:388 deliberately calls `table.insert(a, 0/0,
+		// 42)` and expects no error -- the platform decides where
+		// NaN-as-index lands, but it must not throw.
+		raw, ok := s.ToNumber(2)
+		if !ok {
+			s.LTypeError(2, "number")
+		}
+		var pos int
+		switch {
+		case math.IsNaN(raw):
+			// Truncate to 0; this falls outside [1,n] so the shift is
+			// skipped and the value lands at t[0]. Matches the
+			// upstream observation that NaN-as-index is "platform-
+			// dependent" -- we just need to not raise.
+			pos = 0
+		case math.IsInf(raw, 1) || raw > math.MaxInt:
+			pos = math.MaxInt
+		case math.IsInf(raw, -1) || raw < math.MinInt:
+			pos = math.MinInt
+		default:
+			pos = int(raw)
+		}
 		if 1 <= pos && pos <= n {
 			// Shift t[pos..n] up by one.
 			for k := n; k >= pos; k-- {
