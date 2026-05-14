@@ -108,7 +108,12 @@ type globalState struct {
 // spawns an unbounded chain inside a pcall, expecting a recoverable
 // "C stack overflow" error; that path is the primary consumer of
 // this gate.
-const maxCoResumeDepth = 200
+// 199 instead of 200 to account for the fact that upstream's
+// LUAI_MAXCCALLS counts every C-call (including pcall) but we only
+// bump resumeDepth on coroutine Resume. conformance/pcall.luau:295
+// asserts count == 200 for a pcall(foo) -> coroutine.wrap(foo)()
+// recursion: 1 pcall + 199 wraps = 200 invocations of foo.
+const maxCoResumeDepth = 199
 
 func newGlobalState() *globalState {
 	g := &globalState{

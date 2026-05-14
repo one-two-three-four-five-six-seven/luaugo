@@ -780,8 +780,16 @@ func baseXPCall(s *vm.State) int {
 		// slot, which pcallFromGo overwrites). Anything past slot 2
 		// is leaked frame state from a failed errfunc call.
 		if st == vm.StatusErrErr {
+			// Preserve out-of-memory errors verbatim; upstream's
+			// xpcall propagates allocator failure straight through
+			// nested handler errors (conformance/pcall.luau:176).
+			existing, _ := s.ToString(2)
 			s.SetTop(2)
-			s.PushString("error in error handling")
+			if existing == "not enough memory" {
+				s.PushString("not enough memory")
+			} else {
+				s.PushString("error in error handling")
+			}
 			s.Replace(2)
 		} else {
 			s.SetTop(2)

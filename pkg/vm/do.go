@@ -514,9 +514,17 @@ func (s *stateImpl) pcallFromGo(nargs, nresults, errfunc int) (st Status) {
 			// failure, rewrite the message to "error in error
 			// handling" to match upstream luaG_xpcall semantics
 			// (conformance/errors.luau:211).
+			//
+			// Note: "not enough memory" is intentionally NOT
+			// rewritten -- upstream propagates allocator-failure
+			// errors verbatim through nested pcall/xpcall (see
+			// conformance/pcall.luau:176 which expects an
+			// xpcall(create_huge, handler_that_also_creates_huge)
+			// pair to surface "not enough memory" rather than the
+			// generic in-handler error.)
 			if s.inErrHandler > 0 {
 				if str, ok := errVal.asString(); ok {
-					if strings.Contains(str, "stack overflow") || strings.Contains(str, "not enough memory") {
+					if strings.Contains(str, "stack overflow") {
 						errVal = stringValue(s.gs.intern("error in error handling"))
 					}
 				}
