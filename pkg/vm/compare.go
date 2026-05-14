@@ -102,9 +102,8 @@ func (s *stateImpl) lessThanVal(a, b value) bool {
 	if a.tag == TString && b.tag == TString {
 		return strings.Compare(a.gc.(*tString).str(), b.gc.(*tString).str()) < 0
 	}
-	// Coerce strings to numbers when one side is a number.
 	if a.tag != b.tag {
-		s.runtimeError("attempt to compare " + a.tag.String() + " with " + b.tag.String())
+		s.runtimeError("attempt to compare " + a.tag.String() + " < " + b.tag.String())
 	}
 	if r, ok := s.callOrderTM(a, b, TMLt); ok {
 		return r
@@ -122,7 +121,7 @@ func (s *stateImpl) lessEqualVal(a, b value) bool {
 		return strings.Compare(a.gc.(*tString).str(), b.gc.(*tString).str()) <= 0
 	}
 	if a.tag != b.tag {
-		s.runtimeError("attempt to compare " + a.tag.String() + " with " + b.tag.String())
+		s.runtimeError("attempt to compare " + a.tag.String() + " <= " + b.tag.String())
 	}
 	if r, ok := s.callOrderTM(a, b, TMLe); ok {
 		return r
