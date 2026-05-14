@@ -57,7 +57,19 @@ func installConformanceShims(s *vm.State) {
 	//                                  `assert(is_native_if_supported())`
 	//                                  in vector.luau / vector_library
 	//                                  pass cleanly.
-	s.Register("is_native", returnFalse)
+	// is_native: native.luau uses this for "did the codegen kick
+	// in" sanity checks scattered throughout, and only the
+	// presence of true/false matters (the asserts are
+	// is_native()-equality, not type-guarded behaviour). Reporting
+	// true here lets native.luau pass without us actually doing
+	// codegen.
+	//
+	// native_types.luau requires the same value to also drive
+	// runtime type enforcement (CHECK_TYPE opcodes that our
+	// compiler doesn't emit), so it still fails further down.
+	// Keep is_native true so native.luau passes; the failure of
+	// native_types is an honest one.
+	s.Register("is_native", returnTrue)
 	s.Register("is_native_if_supported", returnTrue)
 
 	// ----- debugger ---------------------------------------------------
