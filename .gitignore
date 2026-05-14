@@ -19,6 +19,9 @@ Thumbs.db
 /.upstream/
 # Local upstream Luau official binaries used for differential testing
 /.upstream-bin/
+# Swarm worktrees -- ephemeral per-agent copies used during multi-agent
+# bug-fix runs. See tools/swarm/README.md.
+/.swarm/
 
 # luau-bcrunner is a small C++ harness built locally; its binary is not
 # committed but the source under tools/luau-bcrunner/ is.
