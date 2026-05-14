@@ -238,12 +238,6 @@ func (s *stateImpl) callUnaryTM(a value, tm TM) (value, bool) {
 
 // arithError raises a Lua runtime error for a failed arithmetic op.
 func (s *stateImpl) arithError(tm TM, b, c value) {
-	var bad value
-	if _, ok := b.asNumber(); !ok && b.tag != TVector {
-		bad = b
-	} else {
-		bad = c
-	}
 	op := ""
 	switch tm {
 	case TMAdd:
@@ -263,7 +257,22 @@ func (s *stateImpl) arithError(tm TM, b, c value) {
 	case TMUnm:
 		op = "unm"
 	}
-	s.runtimeError("attempt to perform arithmetic (" + op + ") on a " + bad.tag.String() + " value")
+	// Unary (unm) only has one operand; report its type.
+	if tm == TMUnm {
+		s.runtimeError("attempt to perform arithmetic (" + op + ") on " + b.tag.String() + " value")
+		return
+	}
+	// Binary ops: upstream's luaG_aritherror lists both operand types
+	// when they differ, only one when they match
+	// (ldebug.cpp:271-274). conformance/errors.luau:379-382 hard-
+	// codes these exact shapes.
+	t1 := b.tag.String()
+	t2 := c.tag.String()
+	if t1 == t2 {
+		s.runtimeError("attempt to perform arithmetic (" + op + ") on " + t1)
+	} else {
+		s.runtimeError("attempt to perform arithmetic (" + op + ") on " + t1 + " and " + t2)
+	}
 }
 
 // doLen implements `#v`. Calls __len for tables/userdata when present.
