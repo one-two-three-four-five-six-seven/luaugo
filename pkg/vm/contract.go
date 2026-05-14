@@ -377,6 +377,11 @@ func (s *State) GCInfo() int { return s.gcInfo() }
 // CollectGarbage runs a full garbage collection cycle.
 func (s *State) CollectGarbage() { s.collectGarbage() }
 
+// GCStep advances the garbage collector by approximately `work` units
+// of internal work. Returns true if the current GC cycle finished
+// during this step. Mirrors upstream lua_gc(LUA_GCSTEP).
+func (s *State) GCStep(work int) bool { return s.impl.gs.gcStep(work) }
+
 // ----------------------------------------------------------------------
 // Library opening
 // ----------------------------------------------------------------------
