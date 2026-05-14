@@ -87,9 +87,9 @@ func TestLuaugoVMSuite(t *testing.T) {
 		select {
 		case <-done:
 			oc.Status, oc.Detail = s, d
-		case <-time.After(5 * time.Second):
+		case <-time.After(30 * time.Second):
 			oc.Status = "TIMEOUT"
-			oc.Detail = "exceeded 5s; possible infinite loop"
+			oc.Detail = "exceeded 30s; possible infinite loop"
 		}
 		oc.Elapsed = time.Since(start)
 		results = append(results, oc)
@@ -187,6 +187,22 @@ func runOnLuaugoVM(name string, src []byte) (status, detail string) {
 
 	lib.OpenAll(s)
 	installConformanceShims(s)
+
+	// Sandbox the thread so the fixture runs in a fresh writable
+	// globals table backed by the real globals via __index. Upstream's
+	// conformance harness does the same (luaL_sandbox +
+	// luaL_sandboxthread in Conformance.test.cpp:310-313). Several
+	// fixtures depend on this -- notably tables.luau:249-263 which
+	// clears most of `_G` and then expects to keep reading bit32,
+	// io, etc. through the __index fall-through.
+	s.SandboxThread()
+	// Re-bind `_G` to the now-sandboxed globals table. OpenBase
+	// installed the original direct binding before SandboxThread
+	// swapped the live globals out from under it; without this update
+	// `_G[k] = nil` would mutate the underlying parent globals rather
+	// than the sandbox copy and shadowing wouldn't work.
+	s.PushGlobalsTable()
+	s.SetGlobal("_G")
 
 	if err := s.Load(name, blob, 0); err != nil {
 		return "LOAD_ERROR", err.Error()

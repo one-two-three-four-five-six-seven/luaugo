@@ -249,6 +249,15 @@ func (s *State) checkStack(n int) bool {
 	if n < 0 {
 		return false
 	}
+	// Mirror upstream lua_checkstack: refuse if either the request
+	// alone, or the resulting top, would exceed LUAI_MAXCSTACK
+	// (8000 slots). conformance/tables.luau:670-677 exercises this
+	// by calling `table.unpack(b)` on an 8000-element table, which
+	// must surface as "too many results to unpack".
+	const LUAI_MAXCSTACK = 8000
+	if n > LUAI_MAXCSTACK || s.impl.top+n > LUAI_MAXCSTACK {
+		return false
+	}
 	s.impl.reserve(n)
 	return true
 }
