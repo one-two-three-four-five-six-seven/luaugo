@@ -46,11 +46,15 @@ type coroutine struct {
 // is true, the coroutine must wake up by raising errValue as if
 // upstream's lua_resumeerror had been called: the error propagates
 // from the yield point through the coroutine body. When errPending is
-// false, values carries the normal resume arguments.
+// false, values carries the normal resume arguments. When shutdown is
+// true, the coroutine's goroutine should exit immediately without
+// running any Lua code; used by State.Close to reclaim suspended
+// coroutines that would otherwise leak their goroutines.
 type resumeMsg struct {
 	values     []value
 	errValue   value
 	errPending bool
+	shutdown   bool
 }
 
 // yieldMsg is sent by the coroutine when it yields or returns or errors.
@@ -92,9 +96,15 @@ func (s *State) newThreadImpl() *State {
 		globals: parent.globals,
 	}
 	parent.gs.gcInit(th, TThread, memSizeThreadHdr)
-	th.co = &coroutine{
+	c := &coroutine{
 		resumeCh: make(chan resumeMsg, 1),
 		yieldCh:  make(chan yieldMsg, 1),
+	}
+	th.co = c
+	// Register so State.Close can signal this goroutine to exit when
+	// the host tears down the VM.
+	if parent.gs.liveCoroutines != nil {
+		parent.gs.liveCoroutines[c] = struct{}{}
 	}
 	w := &State{impl: th}
 	th.wrapper = w
@@ -173,11 +183,24 @@ func (co *State) resumeImpl(from *State, nargs int) Status {
 		go func() {
 			// The goroutine acquires the VM mutex before running.
 			msg := <-c.resumeCh
+			// Shutdown signal from State.Close: exit without running
+			// any Lua code or holding the mutex.
+			if msg.shutdown {
+				c.finished = true
+				return
+			}
 			mu.Lock()
 			func() {
 				defer mu.Unlock()
 				defer func() {
 					if r := recover(); r != nil {
+						// Shutdown sentinel: exit silently without
+						// sending on yieldCh. State.Close has
+						// already stopped caring.
+						if _, ok := r.(coroutineShutdown); ok {
+							c.finished = true
+							return
+						}
 						var errVal value
 						switch e := r.(type) {
 						case luaRTError:
@@ -319,6 +342,14 @@ func (s *State) yieldImpl(nresults int) int {
 	c.yieldCh <- yieldMsg{status: StatusYield, values: vals}
 	mu.Unlock()
 	msg := <-c.resumeCh
+	// Shutdown: State.Close is tearing the VM down. Re-acquire the
+	// mutex briefly so callers reading our state see a consistent
+	// view, then exit by panicking with a sentinel that the
+	// goroutine's defer-recover converts to "coroutine cancelled".
+	if msg.shutdown {
+		mu.Lock()
+		panic(coroutineShutdown{})
+	}
 	mu.Lock()
 	// If the resumer signalled a pending error (resumeerror), wake up
 	// by raising it. The error propagates from this yield point
@@ -333,6 +364,12 @@ func (s *State) yieldImpl(nresults int) int {
 	}
 	return len(msg.values)
 }
+
+// coroutineShutdown is the panic value used to unwind a coroutine
+// goroutine when State.Close signals shutdown. The goroutine's
+// defer-recover converts it into a silent return without sending on
+// yieldCh.
+type coroutineShutdown struct{}
 
 // ResumeError resumes the coroutine, waking it up with `errValue`
 // raised as a Lua error at the yield (or initial call) point. Mirrors

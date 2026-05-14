@@ -83,6 +83,13 @@ type globalState struct {
 	// 246-247's deliberate infinite recursion) errors out before
 	// goroutines accumulate beyond reasonable limits.
 	resumeDepth int
+
+	// liveCoroutines tracks every coroutine that has been started on
+	// this globalState. State.Close uses this to send a shutdown
+	// signal so blocked goroutines (suspended on <-resumeCh) exit
+	// instead of leaking. Indexed by *coroutine for O(1) registration
+	// and removal at finish-time.
+	liveCoroutines map[*coroutine]struct{}
 }
 
 // maxCoResumeDepth caps simultaneously-active nested coroutine
@@ -97,13 +104,14 @@ const maxCoResumeDepth = 200
 
 func newGlobalState() *globalState {
 	g := &globalState{
-		strt:         newStringTable(),
-		currentWhite: gcWhite0Bit,
-		gcstate:      gcPause,
-		gcGoal:       gcDefaultGoal,
-		gcStepMul:    gcDefaultStepMul,
-		gcStepSize:   gcDefaultStepSize,
-		gcThreshold:  gcDefaultStepSize * 1024,
+		strt:           newStringTable(),
+		currentWhite:   gcWhite0Bit,
+		gcstate:        gcPause,
+		gcGoal:         gcDefaultGoal,
+		gcStepMul:      gcDefaultStepMul,
+		gcStepSize:     gcDefaultStepSize,
+		gcThreshold:    gcDefaultStepSize * 1024,
+		liveCoroutines: make(map[*coroutine]struct{}),
 	}
 	return g
 }
@@ -138,9 +146,31 @@ func (s *State) close() {
 		return
 	}
 	s.impl.closed = true
+	g := s.impl.gs
+	// Signal every still-live coroutine to exit. Their goroutines are
+	// blocked on <-resumeCh after a yield; sending a shutdown message
+	// unblocks them and they fall through to their defer-recover,
+	// terminating cleanly. Without this Close, every State that ran
+	// any coroutine that didn't run to completion would leak one
+	// goroutine per yielded coroutine.
+	for c := range g.liveCoroutines {
+		if c.finished {
+			continue
+		}
+		// Non-blocking send: the channel is buffered with cap 1, so
+		// if the coroutine isn't currently parked we just drop the
+		// signal. The goroutine will pick it up on its next receive
+		// (which it must do; suspended coroutines are always parked
+		// on resumeCh).
+		select {
+		case c.resumeCh <- resumeMsg{shutdown: true}:
+		default:
+		}
+	}
+	// Clear the map so subsequent Close calls don't double-send.
+	g.liveCoroutines = nil
 	// Drop references; the Go GC will reclaim everything once nothing
 	// outside the State holds the global_State.
-	g := s.impl.gs
 	g.allgc = nil
 	g.mainthread = nil
 	s.impl.stack = nil
