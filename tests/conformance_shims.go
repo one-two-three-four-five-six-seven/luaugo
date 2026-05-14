@@ -367,8 +367,64 @@ func ensureVec2Metatable(s *vm.State) {
 	s.PushGoFunction(vec2NewIndex, 0)
 	s.SetField(-2, "__newindex")
 
+	// Arithmetic. Componentwise where applicable; promote a scalar
+	// number to (n, n) so `vec2(1,2) * 3` works. native_userdata.luau
+	// `-c + a * b` requires __unm + __add + __mul.
+	bin := func(op func(ax, ay, bx, by float64) (float64, float64)) vm.GoFunction {
+		return func(state *vm.State) int {
+			ax, ay := vec2Coerce(state, 1)
+			bx, by := vec2Coerce(state, 2)
+			rx, ry := op(ax, ay, bx, by)
+			state.PushUserdataObject(&vec2Box{x: rx, y: ry}, vec2UTag)
+			ensureVec2Metatable(state)
+			state.SetMetatable(-2)
+			return 1
+		}
+	}
+	s.PushGoFunction(bin(func(ax, ay, bx, by float64) (float64, float64) { return ax + bx, ay + by }), 0)
+	s.SetField(-2, "__add")
+	s.PushGoFunction(bin(func(ax, ay, bx, by float64) (float64, float64) { return ax - bx, ay - by }), 0)
+	s.SetField(-2, "__sub")
+	s.PushGoFunction(bin(func(ax, ay, bx, by float64) (float64, float64) { return ax * bx, ay * by }), 0)
+	s.SetField(-2, "__mul")
+	s.PushGoFunction(bin(func(ax, ay, bx, by float64) (float64, float64) {
+		if bx == 0 || by == 0 {
+			return 0, 0
+		}
+		return ax / bx, ay / by
+	}), 0)
+	s.SetField(-2, "__div")
+	s.PushGoFunction(func(state *vm.State) int {
+		ax, ay := vec2Coerce(state, 1)
+		state.PushUserdataObject(&vec2Box{x: -ax, y: -ay}, vec2UTag)
+		ensureVec2Metatable(state)
+		state.SetMetatable(-2)
+		return 1
+	}, 0)
+	s.SetField(-2, "__unm")
+	s.PushGoFunction(func(state *vm.State) int {
+		a, _ := state.ToUserdata(1).(*vec2Box)
+		b, _ := state.ToUserdata(2).(*vec2Box)
+		state.PushBoolean(a != nil && b != nil && a.x == b.x && a.y == b.y)
+		return 1
+	}, 0)
+	s.SetField(-2, "__eq")
+
 	s.SetRegistryField(key)
 	s.GetRegistryField(key)
+}
+
+// vec2Coerce extracts (x, y) from a vec2 userdata or a Lua number
+// (broadcast to both components). Returns (0, 0) when neither shape
+// matches; the caller's arithmetic op then degenerates safely.
+func vec2Coerce(s *vm.State, idx int) (float64, float64) {
+	if u, ok := s.ToUserdata(idx).(*vec2Box); ok && u != nil {
+		return u.x, u.y
+	}
+	if v, ok := s.ToNumber(idx); ok {
+		return v, v
+	}
+	return 0, 0
 }
 
 func vec2Index(s *vm.State) int {
