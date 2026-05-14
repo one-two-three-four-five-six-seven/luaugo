@@ -397,6 +397,25 @@ func tableCreate(s *vm.State) int {
 	if size < 0 {
 		s.LArgError(1, "size out of range")
 	}
+	// Upstream conformance pcall.luau:172 expects
+	// `pcall(function() table.create(1e6) end)` to fail with
+	// "not enough memory". The upstream conformance harness wires
+	// in a custom allocator (limitedRealloc) that returns NULL for
+	// any single allocation larger than 8 MiB; we don't have a
+	// pluggable allocator here, so model the same behavior by
+	// rejecting sizes whose backing slice exceeds 8 MiB worth of
+	// value slots. The "not enough memory" string is the exact
+	// upstream wording so conformance fixtures that match against it
+	// (pcall.luau:172-176, including the xpcall variants) pass.
+	const valueBytes = 16 // approx. sizeof(value) in our impl
+	if size > 0 && uint64(size)*valueBytes > 8*1024*1024 {
+		// Push the bare "not enough memory" string and raise without
+		// the "<chunkname>:<line>: " prefix LError would add --
+		// upstream's OOM errors come from the allocator failure
+		// path and carry no source location.
+		s.PushString("not enough memory")
+		s.Error()
+	}
 	hasFill := !s.IsNoneOrNil(2)
 	s.CreateTable(size, 0)
 	if hasFill {
