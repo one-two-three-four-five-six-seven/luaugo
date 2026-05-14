@@ -43,6 +43,14 @@ type stateImpl struct {
 	// suspending. Mirrors upstream's `L->nCcalls > L->baseCcalls`
 	// gate, scoped per-thread.
 	nonyieldable int
+
+	// inErrHandler counts the depth of currently-executing xpcall
+	// error handlers (and other "we're already handling an error"
+	// contexts). When a pcall recovers an error while this is >0,
+	// the recovered error message is replaced with "error in error
+	// handling" so conformance/errors.luau:211 surfaces the expected
+	// string.
+	inErrHandler int
 }
 
 // globalState is the shared "global_State" referenced by every thread

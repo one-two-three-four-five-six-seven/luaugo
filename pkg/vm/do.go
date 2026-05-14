@@ -7,6 +7,7 @@ package vm
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
 	"github.com/one-two-three-four-five-six-seven/luaugo/internal/vmlog"
@@ -508,6 +509,18 @@ func (s *stateImpl) pcallFromGo(nargs, nresults, errfunc int) (st Status) {
 			default:
 				errVal = stringValue(s.gs.intern(fmt.Sprintf("%v", r)))
 			}
+			// When the protected call ran inside an xpcall error
+			// handler and the error is itself a stack-overflow-class
+			// failure, rewrite the message to "error in error
+			// handling" to match upstream luaG_xpcall semantics
+			// (conformance/errors.luau:211).
+			if s.inErrHandler > 0 {
+				if str, ok := errVal.asString(); ok {
+					if strings.Contains(str, "stack overflow") || strings.Contains(str, "not enough memory") {
+						errVal = stringValue(s.gs.intern("error in error handling"))
+					}
+				}
+			}
 			// If errfunc is set, call it with the error value.
 			if ef >= 0 && ef < s.top && s.stack[ef].tag == TFunction {
 				// Run errfunc(errVal) but protect from further error.
@@ -522,7 +535,18 @@ func (s *stateImpl) pcallFromGo(nargs, nresults, errfunc int) (st Status) {
 				// `co(0, coroutine.yield, 0)` to die rather than
 				// yield through the wrapped xpcall.
 				s.nonyieldable++
-				defer func() { s.nonyieldable-- }()
+				// Mark "we're currently handling an error" so any
+				// nested pcall that itself errors out reports the
+				// canonical "error in error handling" string.
+				// conformance/errors.luau:211 hits this when the
+				// xpcall handler internally calls pcall(tostring,
+				// cso) and the inner call also overflows the C
+				// stack.
+				s.inErrHandler++
+				defer func() {
+					s.nonyieldable--
+					s.inErrHandler--
+				}()
 				func() {
 					defer func() {
 						if rr := recover(); rr != nil {
