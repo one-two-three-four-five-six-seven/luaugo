@@ -200,13 +200,25 @@ func (c *compiler) compileBlock(blk *ast.Block) {
 		c.compileStat(stat)
 	}
 
-	// Close any captured locals declared in this block.
-	needClose := false
-	for i := localsBefore; i < len(fc.localStack); i++ {
-		_ = i
-	}
-	if needClose {
-		fc.pb.emitABC(common.OpCloseUpvals, topBefore, 0, 0)
+	// If this block declared any locals, emit CLOSEUPVALS to close any
+	// upvalues that captured them by reference. Without this, when the
+	// block's stack slots are reused (either by a sibling block, or by
+	// the next iteration of an enclosing loop), the still-open upvalue
+	// would alias the new occupant — producing both the classic
+	// "all loop closures share the same variable" bug and, after a
+	// stack reallocation, sporadic "nil where value expected" failures.
+	// CLOSEUPVALS at A=topBefore is a no-op if no upvalue references
+	// any slot >= topBefore, so emitting it unconditionally when the
+	// block declared locals is safe and slightly conservative.
+	declaredLocals := len(fc.localStack) > localsBefore
+	if declaredLocals {
+		// Skip if the last emitted instruction is a no-return terminator
+		// (RETURN/BREAK/CONTINUE/JUMP at the same scope): those already
+		// transfer control elsewhere and any close required has been
+		// handled at the jump source.
+		if !c.lastInsnIsUnreachableTerminator() {
+			fc.pb.emitABC(common.OpCloseUpvals, topBefore, 0, 0)
+		}
 	}
 	// Pop locals from the maps.
 	for i := len(fc.localStack) - 1; i >= localsBefore; i-- {
@@ -219,6 +231,19 @@ func (c *compiler) compileBlock(blk *ast.Block) {
 	}
 	fc.pb.setTop(topBefore)
 	fc.scopeDepth--
+}
+
+// lastInsnIsUnreachableTerminator reports whether the most recently
+// emitted instruction is a RETURN; we don't bother to peek at JUMP
+// because the back-edge of a loop has already taken care of close.
+func (c *compiler) lastInsnIsUnreachableTerminator() bool {
+	fc := c.cur()
+	if len(fc.pb.code) == 0 {
+		return false
+	}
+	last := fc.pb.code[len(fc.pb.code)-1]
+	op := common.InsnOp(last)
+	return op == common.OpReturn
 }
 
 func (c *compiler) compileStat(stat ast.Stat) {
@@ -1553,20 +1578,34 @@ func (c *compiler) compileIfElseExpr(x *ast.ExprIfElse, target uint8) {
 }
 
 func (c *compiler) compileInterpString(x *ast.ExprInterpString, target uint8) {
-	// Compile as `string.format(fmt, args...)` style: but actually
-	// Luau backticks are syntactic sugar for `string.format`. We'll
-	// implement as concat for simplicity.
+	// Luau backtick interpolation desugars (per the Luau spec) to
+	// string.format using the `%*` "tostring" specifier, so every
+	// interpolated expression must be converted via tostring(). Our
+	// simpler implementation emits a CONCAT chain, but each non-
+	// literal slot is funneled through `tostring(expr)` first so that
+	// booleans, numbers, tables, etc. concatenate cleanly. Otherwise
+	// `assertEq(\`true = {true}\`, ...)` would fail with
+	// "attempt to concatenate a boolean value".
 	fc := c.cur()
 	base := fc.pb.top
-	// Total tokens = len(Strings) + len(Expressions) interleaved.
+	// We need tostring(); fetch it via GETGLOBAL "tostring" once.
+	tostrSidx := fc.pb.addStringConstant("tostring")
 	for i := 0; i < len(x.Strings); i++ {
 		r := fc.pb.reserveReg(1)
 		cid := fc.pb.addStringConstant(string(x.Strings[i]))
 		fc.pb.emitLoadK(r, cid)
 		if i < len(x.Expressions) {
+			// Reserve [r2 = tostring slot, r3 = arg slot]; call
+			// tostring(expr) leaving the result at r2.
 			r2 := fc.pb.reserveReg(1)
-			// We must convert to string. Use tostring(expr).
-			c.compileExprToReg(x.Expressions[i], r2)
+			r3 := fc.pb.reserveReg(1)
+			fc.pb.emitABC(common.OpGetGlobal, r2, 0, 0)
+			fc.pb.emitAux(tostrSidx)
+			c.compileExprToReg(x.Expressions[i], r3)
+			fc.pb.emitABC(common.OpCall, r2, 2, 2) // 1 arg, 1 result
+			// After CALL, r2 holds the string. r3 still occupies a
+			// slot but is dead -- free it.
+			fc.pb.setTop(r3)
 		}
 	}
 	count := uint8(fc.pb.top - base)

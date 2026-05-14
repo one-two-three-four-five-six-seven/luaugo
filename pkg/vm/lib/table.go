@@ -237,7 +237,32 @@ func tableMove(s *vm.State) int {
 	s.LCheckType(dstIdx, vm.TTable)
 
 	if e >= f {
+		// Range-validity checks mirror upstream ltablib.cpp tmove.
+		// Without them, table.move({}, 0, INT_MAX, 1) would attempt
+		// ~2 billion iterations before observing the destination
+		// readonly check, which is exactly what conformance/move.luau
+		// asserts against ("too many elements to move").
+		//
+		// Upstream uses C `int` (32-bit) so the bounds are 32-bit
+		// INT_MAX. The fixtures are written against that contract;
+		// any larger index is considered "too many" regardless of
+		// the host int size.
+		const (
+			maxInt32 = 2147483647
+			minInt32 = -2147483648
+		)
+		// Clamp to int32 range up front -- fixtures pass at the
+		// boundaries (move.luau uses maxI=2^31-1, minI=-2^31).
+		if f < minInt32 || f > maxInt32 || e < minInt32 || e > maxInt32 || d < minInt32 || d > maxInt32 {
+			s.LArgError(3, "too many elements to move")
+		}
+		if !(f > 0 || e < maxInt32+f) {
+			s.LArgError(3, "too many elements to move")
+		}
 		n := e - f + 1
+		if d > maxInt32-n+1 {
+			s.LArgError(4, "destination wrap around")
+		}
 		// Reject writes into a frozen destination up front so partial
 		// copies don't leak state when the first RawSetI raises.
 		if s.GetReadonly(dstIdx) {
@@ -252,11 +277,36 @@ func tableMove(s *vm.State) int {
 		if ascending {
 			for i := 0; i < n; i++ {
 				s.RawGetI(1, f+i)
+				// Skip writing nil into slots that don't already
+				// have a binding: pure-nil writes would otherwise
+				// force a fresh hash node and (eventually) a
+				// rehash, which is prohibitively expensive when
+				// moving large sparse ranges (see move.luau:87).
+				if s.IsNil(-1) {
+					// Need to overwrite only when the slot is
+					// already populated. RawGetI followed by check.
+					s.RawGetI(dstIdx, d+i)
+					existsNil := s.IsNil(-1)
+					s.Pop(1)
+					if existsNil {
+						s.Pop(1)
+						continue
+					}
+				}
 				s.RawSetI(dstIdx, d+i)
 			}
 		} else {
 			for i := n - 1; i >= 0; i-- {
 				s.RawGetI(1, f+i)
+				if s.IsNil(-1) {
+					s.RawGetI(dstIdx, d+i)
+					existsNil := s.IsNil(-1)
+					s.Pop(1)
+					if existsNil {
+						s.Pop(1)
+						continue
+					}
+				}
 				s.RawSetI(dstIdx, d+i)
 			}
 		}

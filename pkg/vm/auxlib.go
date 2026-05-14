@@ -226,6 +226,14 @@ func (s *State) Where(level int) string {
 	if line > 0 {
 		return fmt.Sprintf("%s:%d: ", src, line)
 	}
+	// Even without precise line info we still emit "<chunk>:0: " so
+	// that error messages match the upstream `<source>:<line>: <msg>`
+	// shape that fixtures like assert.luau rely on with
+	// `err:find(": ")`. Tier-3 compiler does not yet emit LineInfo;
+	// once that's wired up, line will be > 0 and this fallback no-ops.
+	if src != "" {
+		return fmt.Sprintf("%s:0: ", src)
+	}
 	return ""
 }
 

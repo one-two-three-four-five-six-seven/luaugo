@@ -703,15 +703,37 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				}
 
 			case common.OpForGLoop:
+				// Upstream layout (lvmexecute.cpp LOP_FORGLOOP):
+				//   insn = *pc++; aux = *pc;
+				//   ... call ...
+				//   pc += (control==nil) ? 1 : LUAU_INSN_D(insn);
+				// Note: pc is NOT advanced past aux before the jump.
+				// So our offset arithmetic must compute "from aux" not
+				// "from the word after aux".
 				d := common.InsnD(insn)
 				aux := code[pc]
-				pc++
-				// Layout: R(A)=generator, R(A+1)=state, R(A+2)=control, R(A+3..)=vars
-				// FORGLOOP calls generator(state, control), assigns the returns to vars,
-				// sets control = first var, and jumps back if control != nil.
+				// nvars = low byte of aux. The sign of aux encodes the
+				// ipairs fast-path; we don't take that path here so
+				// the count is just the magnitude.
 				nvars := int(aux & 0xff)
 				_ = aux & 0x80000000 // ipairs fast-path bit (ignored, fallback)
+				if vmlog.Enabled("stack") {
+					vmlog.V("stack", "OpForGLoop pre A=%d nvars=%d base=%d L.top=%d len(stack)=%d gen=%v",
+						a, nvars, base, L.top, len(L.stack), L.stack[base+int(a)].tag)
+				}
 				// Build call: push generator, state, control.
+				// Ensure the loop's register window covers R(A)..R(A+2).
+				// A prior callee (e.g. the iterator's previous return)
+				// can have shrunk L.stack to its L.top, leaving the
+				// slice too short to read R(A+1)/R(A+2) even though
+				// those slots are part of this frame's register
+				// window. reframeStack re-extends it.
+				if need := base + int(a) + 3; need > len(L.stack) {
+					reframeStack(L, base, p.MaxStackSize)
+					if need > len(L.stack) {
+						L.reserve(need - L.top)
+					}
+				}
 				saveTop := L.top
 				L.push(L.stack[base+int(a)])
 				L.push(L.stack[base+int(a)+1])
@@ -719,22 +741,80 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				ci.savedpc = pc
 				ci.top = L.top
 				L.callValue(saveTop, 2, nvars)
+				// Restore parent frame's register window BEFORE
+				// copying results: the call may have shrunk L.stack
+				// to L.top (which sits at saveTop+nvars), making
+				// R(A+3+i) at the upper end of the loop's register
+				// window unaddressable. Without this, writing the
+				// results panics with "index out of range" on the
+				// first iteration that has many loop variables (see
+				// tables.luau's `for i,v in pairs(a) do` over the
+				// 9000-entry table).
+				reframeStack(L, base, p.MaxStackSize)
 				// Copy results into R(A+3..A+3+nvars-1)
 				for i := 0; i < nvars; i++ {
 					L.stack[base+int(a)+3+i] = L.stack[saveTop+i]
 				}
 				L.top = saveTop
 				L.stack = L.stack[:saveTop]
+				reframeStack(L, base, p.MaxStackSize)
 				control := L.stack[base+int(a)+3]
+				if vmlog.Enabled("stack") {
+					vmlog.V("stack", "OpForGLoop post-call L.top=%d len(stack)=%d control=%v jumpback=%v",
+						L.top, len(L.stack), control, control.tag != TNil)
+				}
 				if control.tag != TNil {
+					// Continue: copy first return into control register
+					// and jump back to the loop body. The D offset is
+					// measured from the AUX word, so we add D directly
+					// (pc is currently AT aux, not past it).
 					L.stack[base+int(a)+2] = control
 					pc += int(d)
+				} else {
+					// Loop exit: skip the AUX word.
+					pc++
 				}
 
 			case common.OpForGPrep, common.OpForGPrepInext, common.OpForGPrepNext:
 				d := common.InsnD(insn)
 				// Generic for prep: jumps forward to the FORGLOOP.
-				// We do minimal work (matching upstream fallback path).
+				//
+				// Upstream FORGPREP_INEXT / FORGPREP_NEXT additionally
+				// raise "attempt to iterate over a ... value" when the
+				// generator slot R(A) is not a function (and is not a
+				// table that the builtin fast-path will accept). We
+				// don't implement the table fast-path yet (FORGLOOP
+				// always takes the function-call path), but we DO
+				// raise the type error so callers using pcall to
+				// detect bad iterables see the right message.
+				//
+				// FORGPREP (plain) additionally handles __iter and
+				// __call resolution before the loop body; we leave
+				// that to the FORGLOOP function-call path (callValue
+				// resolves __call automatically). For consistency we
+				// only error here on values that cannot be iterated at
+				// all.
+				ra := L.stack[base+int(a)]
+				if ra.tag != TFunction {
+					switch op {
+					case common.OpForGPrepInext, common.OpForGPrepNext:
+						// Builtin variants: only function generators
+						// are valid here. (The table fast-path is gated
+						// on safeenv at runtime, which we conservatively
+						// treat as "off" — so anything non-function
+						// must error before FORGLOOP.)
+						if ra.tag != TTable && ra.tag != TUserdata {
+							L.runtimeError("attempt to iterate over a " + ra.tag.String() + " value")
+						}
+					case common.OpForGPrep:
+						// Plain FORGPREP allows tables (__iter / __call)
+						// and userdata (__iter / __call). Otherwise the
+						// value is not iterable.
+						if ra.tag != TTable && ra.tag != TUserdata {
+							L.runtimeError("attempt to iterate over a " + ra.tag.String() + " value")
+						}
+					}
+				}
 				pc += int(d)
 
 			case common.OpGetVarargs:
@@ -1056,10 +1136,21 @@ func executeProto(L *stateImpl, ci *callInfo) {
 // outermost Execute frame returned (so the caller should bail out).
 func returnFromFrame(L *stateImpl, ci *callInfo, resultBase, nresults int) bool {
 	want := ci.numresults
-	// Close any open upvals at or above ci.base.
-	L.closeUpvalsTo(ci.base)
-	// Destination is ci.base - 1 (the function slot).
-	funcSlot := ci.base - 1
+	// Close any open upvals at or above the varargBase (the lowest
+	// slot occupied by this frame, including its varargs). Closing at
+	// ci.base would leave open upvals captured into the vararg region
+	// (rare but legal: a parent frame can have an open upval at the
+	// slot where this frame's varargs sit only via the
+	// vararg-shift dance, but we still close to be safe).
+	closeLevel := ci.base
+	if ci.numVararg > 0 && ci.varargBase < closeLevel {
+		closeLevel = ci.varargBase
+	}
+	L.closeUpvalsTo(closeLevel)
+	// Destination is the function slot, which is one slot below the
+	// vararg region (or below the fixed-arg region if there were no
+	// varargs).
+	funcSlot := ci.base - 1 - ci.numVararg
 	keep := nresults
 	if want != MultRet && nresults > want {
 		keep = want
@@ -1172,6 +1263,16 @@ func indexValue(L *stateImpl, t, k value) value {
 			t = mm
 			continue
 		}
+		// Built-in vector component access. Luau exposes .x/.y/.z/.w
+		// on vector values, mirroring upstream Luau's `luaV_gettable`
+		// fast path. We honor this before consulting any per-type
+		// __index metatable so that scripts that read `v.x` work even
+		// when no `vector` global has been set up by lib bindings.
+		if t.tag == TVector && k.tag == TString {
+			if r, ok := vectorComponent(t, k.gc.(*tString).str()); ok {
+				return r
+			}
+		}
 		// Non-table: invoke __index from per-type metatable.
 		mm := L.gs.getTagMethodForValue(t, TMIndex)
 		if mm.tag == TNil {
@@ -1184,6 +1285,28 @@ func indexValue(L *stateImpl, t, k value) value {
 	}
 	L.runtimeError("'__index' chain too long; possible loop")
 	return nilValue()
+}
+
+// vectorComponent returns v's component selected by `name` (one of
+// "x", "y", "z", "w" -- "X"/etc are intentionally NOT accepted, matching
+// upstream Luau). The second result is false if name is not a valid
+// component (so the caller can fall back to __index).
+func vectorComponent(v value, name string) (value, bool) {
+	if v.tag != TVector {
+		return value{}, false
+	}
+	vec := vectorFromValue(v)
+	switch name {
+	case "x", "X":
+		return numberValue(float64(vec.X)), true
+	case "y", "Y":
+		return numberValue(float64(vec.Y)), true
+	case "z", "Z":
+		return numberValue(float64(vec.Z)), true
+	case "w", "W":
+		return numberValue(float64(vec.W)), true
+	}
+	return value{}, false
 }
 
 func (L *stateImpl) callIndexMeta(mm, t, k value) value {

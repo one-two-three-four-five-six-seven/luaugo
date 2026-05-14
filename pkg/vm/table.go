@@ -290,6 +290,16 @@ func tryArrayIndex(n float64) (int, bool) {
 
 // set writes t[k]=v. The write barrier (if any) is invoked at the
 // upper layer.
+//
+// Mirrors upstream Luau's `newkey` flow: when the key looks like it
+// should live in the array part (k == sizearray+1) we rehash once to
+// grow the array; otherwise the key goes into the hash part. We
+// deliberately do NOT loop on the boundary-rehash case: rehash may
+// decide that the new effective array size is still too small for k
+// (e.g. when several earlier array slots are nil, the load-factor
+// heuristic in computeSizes elects not to grow), in which case
+// looping would rehash forever (see conformance/vararg.luau, which
+// builds a table from a vararg pack containing nils).
 func (t *table) set(g *globalState, k, v value) {
 	if t.readonly {
 		panic(luaError{message: "attempt to modify a readonly table"})
@@ -300,46 +310,105 @@ func (t *table) set(g *globalState, k, v value) {
 	if k.tag == TNumber && math.IsNaN(k.num) {
 		panic(luaError{message: "table index is NaN"})
 	}
-	// Retry-loop: rehashes inside findOrInsert can grow the array
-	// part such that an integer key that was previously hash-bound
-	// now belongs in the array.
-	for {
-		if k.tag == TNumber {
-			if i, ok := tryArrayIndex(k.num); ok && i >= 1 && i <= len(t.array) {
-				t.array[i-1] = v
-				t.tmcache = 0
-				if v.isCollectable() && v.gc != nil {
-					g.barrierTable(t, v.gc)
-				}
-				return
-			}
-		}
-		// Walk existing hash chain first to see if the key already
-		// has a node we can update in place.
-		if existing := t.findExistingNode(k); existing != nil {
-			existing.val = v
+	// Fast path: existing array slot.
+	if k.tag == TNumber {
+		if i, ok := tryArrayIndex(k.num); ok && i >= 1 && i <= len(t.array) {
+			t.array[i-1] = v
 			t.tmcache = 0
 			if v.isCollectable() && v.gc != nil {
 				g.barrierTable(t, v.gc)
 			}
 			return
 		}
-		// Need a fresh slot. If newKey triggers a rehash that absorbs
-		// k into the array part, we restart the loop so the array
-		// branch above is taken.
-		grew := t.tryNewKey(g, k)
-		if grew {
-			continue
-		}
-		// We have a fresh hash node; locate and fill it.
-		existing := t.findExistingNode(k)
-		if existing == nil {
-			// Shouldn't happen: tryNewKey returned false meaning the
-			// slot was installed directly.
-			panic("vm: table set lost newly installed key")
-		}
+	}
+	// Existing hash slot: update in place.
+	if existing := t.findExistingNode(k); existing != nil {
 		existing.val = v
 		t.tmcache = 0
+		if v.isCollectable() && v.gc != nil {
+			g.barrierTable(t, v.gc)
+		}
+		return
+	}
+	// Boundary case: if k looks like it should extend the array, try
+	// rehashing once to grow it. After rehash, k may end up in either
+	// the array part (if growth was approved) or stay a hash key.
+	if k.tag == TNumber {
+		if i, ok := tryArrayIndex(k.num); ok && i == len(t.array)+1 {
+			t.rehash(g, k)
+			// Post-rehash: take whichever slot is appropriate now.
+			if j, ok2 := tryArrayIndex(k.num); ok2 && j >= 1 && j <= len(t.array) {
+				t.array[j-1] = v
+				t.tmcache = 0
+				if v.isCollectable() && v.gc != nil {
+					g.barrierTable(t, v.gc)
+				}
+				return
+			}
+			// fall through: k still doesn't fit array, install in hash
+		}
+	}
+	// Install in hash. tryNewKeyInHash never triggers a recursive
+	// boundary rehash, so this terminates.
+	t.installNewHashKey(g, k, v)
+}
+
+// installNewHashKey places a brand-new key in the hash part, growing
+// the hash table via rehash if necessary. Unlike tryNewKey it never
+// tries to absorb the key into the array part: the caller has already
+// decided that the array path doesn't apply.
+func (t *table) installNewHashKey(g *globalState, k, v value) {
+	for {
+		if len(t.nodes) == 0 {
+			t.setNodeVector(2)
+		}
+		mp := t.mainPosition(k)
+		if t.nodes[mp].key.tag != TNil {
+			free := t.getFreePos()
+			if free < 0 {
+				t.rehash(g, k)
+				// Rehash may have absorbed k into the array part if
+				// computeSizes finally decided to grow. Re-check.
+				if k.tag == TNumber {
+					if i, ok := tryArrayIndex(k.num); ok && i >= 1 && i <= len(t.array) {
+						t.array[i-1] = v
+						t.tmcache = 0
+						if v.isCollectable() && v.gc != nil {
+							g.barrierTable(t, v.gc)
+						}
+						return
+					}
+				}
+				continue
+			}
+			other := t.mainPosition(t.nodes[mp].key)
+			if other != mp {
+				prev := other
+				for prev+int(t.nodes[prev].next) != mp {
+					prev += int(t.nodes[prev].next)
+				}
+				t.nodes[prev].next = int32(free - prev)
+				t.nodes[free] = t.nodes[mp]
+				if t.nodes[mp].next != 0 {
+					t.nodes[free].next += int32(mp - free)
+					t.nodes[mp].next = 0
+				}
+				t.nodes[mp].key = nilValue()
+				t.nodes[mp].val = nilValue()
+			} else {
+				if t.nodes[mp].next != 0 {
+					t.nodes[free].next = int32(mp + int(t.nodes[mp].next) - free)
+				}
+				t.nodes[mp].next = int32(free - mp)
+				mp = free
+			}
+		}
+		t.nodes[mp].key = k
+		t.nodes[mp].val = v
+		t.tmcache = 0
+		if k.isCollectable() && k.gc != nil {
+			g.barrierTable(t, k.gc)
+		}
 		if v.isCollectable() && v.gc != nil {
 			g.barrierTable(t, v.gc)
 		}
@@ -475,6 +544,14 @@ func (t *table) rehash(g *globalState, ek value) {
 	}
 	na := computeSizes(nums, &nasize)
 	nh := totaluse - na
+	// Guarantee forward progress: every rehash must add capacity for
+	// at least one more entry. Without this, set() can spin in a
+	// rehash loop when the sizing heuristic stays at the same shape
+	// after the insertion attempt (notably when ek belongs to a hash
+	// slot whose mainPosition is already full).
+	if nh <= len(t.nodes) && nasize <= len(t.array) {
+		nh = len(t.nodes) + 1
+	}
 	t.resize(g, nasize, nh)
 }
 

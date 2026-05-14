@@ -158,8 +158,27 @@ func (s *stateImpl) checkIndex(idx int) int {
 	return i
 }
 
+// reserve ensures the live region of the stack covers at least
+// s.top + n slots.
+//
+// Subtle: this function must only EXTEND the slice, never SHRINK it.
+// The interpreter routinely keeps s.top below len(s.stack) while
+// register operations (MOVE/LOADK/...) write to slots above s.top
+// without bumping it; OpCall, OpForGLoop, OpSetList, etc. then read
+// those higher slots when gathering arguments. An earlier version of
+// this function unconditionally did
+//
+//	s.stack = s.stack[:need]
+//
+// which truncates whenever s.top < need < len(s.stack), silently
+// invalidating the in-flight argument frame and producing
+// "index out of range" panics inside OpForGLoop and OpSetList when
+// they pulled from those slots (see tables.luau).
 func (s *stateImpl) reserve(n int) {
 	need := s.top + n
+	if need <= len(s.stack) {
+		return
+	}
 	if cap(s.stack) >= need {
 		s.stack = s.stack[:need]
 		return

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/compiler"
 	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/vm"
 )
 
@@ -82,47 +83,14 @@ func registerBaseFunctions(s *vm.State) {
 	}
 }
 
-// installGlobalProxy installs `_G` as a table that transparently
-// forwards reads and writes to the real globals table via
-// metamethods.
+// installGlobalProxy installs `_G` as the thread's actual globals
+// table. Upstream Luau / Lua bind `_G` directly to the globals so
+// that `_G[k] = v` works for any key, not just strings, and so that
+// `_G == getfenv()`. We do the same via PushGlobalsTable, which is
+// the runtime-helper analogue of `lua_pushvalue(L, LUA_GLOBALSINDEX)`.
 func installGlobalProxy(s *vm.State) {
-	s.NewTable()
-	proxyIdx := s.Top()
-
-	s.NewTable() // metatable
-	s.PushGoFunction(globalIndex, 0)
-	s.SetField(-2, "__index")
-	s.PushGoFunction(globalNewIndex, 0)
-	s.SetField(-2, "__newindex")
-	s.PushString("The metatable is locked")
-	s.SetField(-2, "__metatable")
-
-	s.SetMetatable(proxyIdx)
-
-	// SetGlobal pops the proxy off the stack.
+	s.PushGlobalsTable()
 	s.SetGlobal("_G")
-}
-
-// globalIndex implements __index for the _G proxy: t[k] -> globals[k].
-func globalIndex(s *vm.State) int {
-	if s.Type(2) != vm.TString {
-		s.PushNil()
-		return 1
-	}
-	name, _ := s.ToString(2)
-	s.GetGlobal(name)
-	return 1
-}
-
-// globalNewIndex implements __newindex for the _G proxy: t[k] = v.
-func globalNewIndex(s *vm.State) int {
-	if s.Type(2) != vm.TString {
-		s.LError("invalid global key (string expected)")
-	}
-	name, _ := s.ToString(2)
-	s.PushValue(3)
-	s.SetGlobal(name)
-	return 0
 }
 
 // ----------------------------------------------------------------------
@@ -131,7 +99,10 @@ func globalNewIndex(s *vm.State) int {
 
 func baseAssert(s *vm.State) int {
 	if s.Top() < 1 {
-		s.LError("missing argument #1 to 'assert'")
+		// Match upstream Luau's exact message ("missing argument #1")
+		// so that conformance fixtures comparing error suffixes (see
+		// assert.luau) succeed.
+		s.LError("missing argument #1")
 	}
 	if !s.ToBoolean(1) {
 		msg := s.LOptString(2, "assertion failed!")
@@ -244,13 +215,40 @@ func baseSetMetatable(s *vm.State) int {
 }
 
 // ----------------------------------------------------------------------
-// loadstring -- disabled (no runtime parser in the luaugo VM).
+// loadstring -- compiles a Lua source string with pkg/compiler and
+// pushes the resulting closure. Mirrors upstream lbaselib.cpp
+// `luaB_loadstring`, which simply forwards to `luaL_loadbuffer`.
+//
+// Signature (Luau/Lua 5.1): loadstring(source [, chunkname])
+//   -> function | (nil, errmsg)
 // ----------------------------------------------------------------------
 
 func baseLoadString(s *vm.State) int {
-	s.PushNil()
-	s.PushString("loadstring disabled")
-	return 2
+	src := s.LCheckString(1)
+	chunkname := s.LOptString(2, "=(loadstring)")
+
+	blob, err := compiler.CompileBinary(chunkname, []byte(src), compiler.Defaults())
+	if err != nil {
+		s.PushNil()
+		s.PushString(err.Error())
+		return 2
+	}
+	// CompileBinary embeds parse/compile errors into the blob by
+	// emitting a leading 0 byte followed by the error message; the
+	// decoder surfaces this via LoadError, but for loadstring we want
+	// to expose it as (nil, errmsg) directly.
+	if len(blob) > 0 && blob[0] == 0 {
+		s.PushNil()
+		s.PushString(string(blob[1:]))
+		return 2
+	}
+	if err := s.Load(chunkname, blob, 0); err != nil {
+		s.PushNil()
+		s.PushString(err.Error())
+		return 2
+	}
+	// Loaded closure is now on top of the stack.
+	return 1
 }
 
 // ----------------------------------------------------------------------

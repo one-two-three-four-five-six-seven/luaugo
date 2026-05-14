@@ -7,6 +7,8 @@ package vm
 
 import (
 	"fmt"
+
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/vmlog"
 )
 
 // do.go: call frame management and protected-call entry points.
@@ -20,6 +22,20 @@ import (
 // MultRet is the special "all return values" sentinel used by lua_call
 // and friends.
 const MultRet = -1
+
+// maxCallDepth caps Lua's call stack depth to prevent unbounded
+// recursion from running until Go's own stack overflows (or, on the
+// heap-based frame stack used here, until we OOM). Mirrors upstream
+// Luau's LUAI_MAXCALLS (luaconf.h: 20000). When exceeded we raise a
+// normal Lua runtime error so pcall can recover it -- exactly what
+// fixtures like native.luau's fuzzfail3 and conformance/pm.luau's
+// `range(0, 255)` expect.
+//
+// Note: upstream distinguishes LUAI_MAXCALLS (overall, 20000) from
+// LUAI_MAXCCALLS (native stack guard, 200). We use a single limit
+// because our frame stack lives on the Go heap so we don't need a
+// separate guard for native-stack exhaustion.
+const maxCallDepth = 20000
 
 // callInfo describes one Lua call frame. Mirrors upstream CallInfo
 // (lstate.h).
@@ -65,7 +81,16 @@ const (
 )
 
 // pushFrame pushes a new call frame onto the state's frame stack.
+//
+// Raises a runtime error (recoverable by pcall) when the call depth
+// exceeds maxCallDepth, mirroring upstream Luau's "stack overflow"
+// behaviour. Without this guard, deeply recursive scripts loop until
+// the host OOMs (see native.luau::fuzzfail3, which intentionally
+// recurses to test pcall's overflow recovery).
 func (s *stateImpl) pushFrame(cl *closure, base int, numresults int, flags ciFlags) *callInfo {
+	if len(s.frames) >= maxCallDepth {
+		s.runtimeError("stack overflow")
+	}
 	ci := &callInfo{
 		cl:         cl,
 		base:       base,
@@ -202,31 +227,126 @@ func (s *stateImpl) callGo(cl *closure, funcIdx, nargs, nresults int) {
 // callLua invokes a Lua closure by running the interpreter loop.
 func (s *stateImpl) callLua(cl *closure, funcIdx, nargs, nresults int) {
 	p := cl.proto
-	base := funcIdx + 1
-
-	// Handle varargs: fixed params are at base..base+numparams-1; extra
-	// args remain accessible via GETVARARGS but conceptually live
-	// "before" base in upstream's layout. We model this by storing the
-	// "extra args" base in the callInfo and copying fixed args after.
 	numparams := int(p.NumParams)
+
+	// Pad missing fixed params with nil so callees always see a full
+	// fixed-arg block. Arguments currently live at funcIdx+1..funcIdx+nargs.
 	if nargs < numparams {
-		// pad missing params with nil
 		for i := nargs; i < numparams; i++ {
-			if base+i >= len(s.stack) {
-				s.reserve(base + i + 1 - s.top)
+			idx := funcIdx + 1 + i
+			if idx >= len(s.stack) {
+				s.reserve(idx + 1 - s.top)
 			}
-			s.stack[base+i] = nilValue()
+			s.stack[idx] = nilValue()
 		}
-		s.top = base + numparams
+		s.top = funcIdx + 1 + numparams
 		s.stack = s.stack[:s.top]
 		nargs = numparams
 	}
 
-	// Reserve stack room for the function's max stack size.
+	if vmlog.Enabled("call") {
+		vmlog.V("call", "callLua funcIdx=%d nargs=%d numparams=%d isVararg=%v maxStack=%d",
+			funcIdx, nargs, numparams, p.IsVararg != 0, p.MaxStackSize)
+	}
+
+	// For vararg functions we follow the upstream layout: the function
+	// closure stays at funcIdx, then the EXTRA args (varargs) occupy
+	// the slots immediately above it, then the FIXED args, then
+	// scratch. The frame's `base` is set to the slot AFTER the extras
+	// so that R(0)..R(numparams-1) are the fixed args. GETVARARGS then
+	// reads from [base-extra..base-1].
+	//
+	// Concretely we shift the nargs values up by `extra` so that the
+	// last `extra` of them sit immediately above funcIdx (the varargs)
+	// while the first `numparams` end up at the new base.
+	base := funcIdx + 1
+	extra := 0
+	if p.IsVararg != 0 && nargs > numparams {
+		extra = nargs - numparams
+		// Make room: ensure we have extra more slots above the current
+		// arg block. Current args occupy [funcIdx+1 .. funcIdx+nargs];
+		// after the shift, the fixed args will be at
+		// [funcIdx+1+extra .. funcIdx+1+extra+numparams-1].
+		needTopShift := funcIdx + 1 + extra + numparams
+		if needTopShift > s.top {
+			s.reserve(needTopShift - s.top)
+			s.top = needTopShift
+			s.stack = s.stack[:s.top]
+		}
+		// Move the FIXED args (the first numparams of the nargs block)
+		// up by `extra`. The trailing `extra` values stay at the
+		// original positions and become the varargs.
+		// Original: [funcIdx+1 .. funcIdx+1+numparams-1] = fixed
+		//           [funcIdx+1+numparams .. funcIdx+1+nargs-1] = extras
+		// Target:   [funcIdx+1 .. funcIdx+1+extra-1]          = extras (kept)
+		//           [funcIdx+1+extra .. funcIdx+1+extra+numparams-1] = fixed
+		// So we need to swap the two blocks. Simplest:
+		//   1. snapshot the fixed args
+		//   2. move the extras down into [funcIdx+1 .. funcIdx+extra]
+		//   3. copy the snapshotted fixed args into the new fixed
+		//      window.
+		// But the extras already are at [funcIdx+1+numparams .. ];
+		// we want them at [funcIdx+1 ..]. And the fixed already are at
+		// [funcIdx+1 ..]; we want them at [funcIdx+1+extra ..]. That's
+		// a rotation. We can implement with two scratch buffers.
+		fixed := make([]value, numparams)
+		extras := make([]value, extra)
+		for i := 0; i < numparams; i++ {
+			fixed[i] = s.stack[funcIdx+1+i]
+		}
+		for i := 0; i < extra; i++ {
+			extras[i] = s.stack[funcIdx+1+numparams+i]
+		}
+		for i := 0; i < extra; i++ {
+			s.stack[funcIdx+1+i] = extras[i]
+		}
+		for i := 0; i < numparams; i++ {
+			s.stack[funcIdx+1+extra+i] = fixed[i]
+		}
+		base = funcIdx + 1 + extra
+		// Bump s.top to past the fixed-arg slots: the subsequent
+		// nil-fill that grows up to base+MaxStackSize would otherwise
+		// overwrite the just-shifted fixed args (which still need to
+		// be visible to the callee as its R(0)..R(numparams-1)).
+		if afterFixed := base + numparams; afterFixed > s.top {
+			s.top = afterFixed
+			s.stack = s.stack[:s.top]
+		}
+	}
+
+	// Ensure L.top covers the fixed-arg window before we nil-pad the
+	// scratch area. Opcodes that placed the call's arguments (MOVE,
+	// LOADK, LOADN, ...) write directly to register slots without
+	// raising L.top, so the caller's recorded top can sit BELOW the
+	// first argument. The nil-padding loop below clears every slot
+	// from s.top up to base+MaxStackSize, so if we leave s.top there
+	// the freshly-placed arguments get clobbered with nil before the
+	// callee can read them. (This was the root cause of the
+	// "attempt to compare nil with number" failure on constructs.luau:
+	// f(12) ran with R0 = nil.)
+	//
+	// Fixed args occupy [base, base+numparams) in both the vararg and
+	// non-vararg layouts (after the shift above). For non-vararg
+	// callees with nargs > numparams the extra args sit at
+	// [base+numparams, base+nargs) and are discarded by the callee, so
+	// nilling them is fine and we don't need to preserve them.
+	argTop := base + numparams
+	if p.IsVararg == 0 && nargs > numparams {
+		argTop = base + nargs
+	}
+	if argTop > s.top {
+		if argTop > len(s.stack) {
+			s.reserve(argTop - s.top)
+		}
+		s.top = argTop
+		s.stack = s.stack[:s.top]
+	}
+
+	// Reserve stack room for the function's max stack size at the new
+	// base.
 	needTop := base + int(p.MaxStackSize)
 	if needTop > s.top {
 		s.reserve(needTop - s.top)
-		// pad new slots with nil (already done by reserve via slicing).
 		for i := s.top; i < needTop; i++ {
 			s.stack[i] = nilValue()
 		}
@@ -235,36 +355,9 @@ func (s *stateImpl) callLua(cl *closure, funcIdx, nargs, nresults int) {
 
 	ci := s.pushFrame(cl, base, nresults, ciLua|ciFresh)
 	ci.top = base + int(p.MaxStackSize)
-	// For varargs functions, store the extras before `base`. Upstream
-	// uses a "base" pointer that moves so fixed args are at [0..numparams-1]
-	// while varargs sit at a lower index. We instead store the count
-	// of varargs and their starting offset on the frame.
 	if p.IsVararg != 0 {
-		ci.numVararg = nargs - numparams
-		ci.varargBase = base - ci.numVararg
-		// Move fixed args down into [base..base+numparams-1] and
-		// varargs into [varargBase..base-1].
-		// Currently fixed args are at [base..base+nargs-1]. We want
-		// fixed args at [base..base+numparams-1] and varargs at
-		// [varargBase..base-1].
-		// Shift fixed args left by 0 (they're already there). Place
-		// extra args at varargBase. We need to insert space before
-		// base for the varargs.
-		extra := nargs - numparams
-		if extra > 0 {
-			// Need room before base. Easier approach: move fixed args
-			// up to make space, then move extras into [base..base+extra-1]
-			// and then shift fixed args back. Actually we'll keep the
-			// upstream invariant by storing varargs ABOVE the fixed
-			// stack (at base+numparams..base+nargs-1) and remember that
-			// when GETVARARGS executes we copy from there. Reset:
-			ci.numVararg = extra
-			ci.varargBase = base + numparams
-			// Reset fixed param area: it's already correct.
-		} else {
-			ci.numVararg = 0
-			ci.varargBase = base
-		}
+		ci.numVararg = extra
+		ci.varargBase = base - extra
 	}
 
 	// Run interpreter.
