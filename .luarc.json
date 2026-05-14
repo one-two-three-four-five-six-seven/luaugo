@@ -1,0 +1,19 @@
+{
+    "diagnostics.globals": [
+        "game",
+        "Game",
+        "workspace",
+        "Workspace",
+        "Players",
+        "Camera",
+        "script",
+        "shared",
+        "_G",
+        "getgenv"
+    ],
+    "workspace.library": [
+        "c:\\Users\\user\\.vscode-oss\\extensions\\undefined_publisher.matcha-intellisense-0.0.1\\api.d.lua",
+        "c:\\Users\\user\\.vscode-oss\\extensions\\undefined_publisher.matcha-intellisense-0.0.1\\types.d.lua",
+        "c:\\Users\\user\\.vscode-oss\\extensions\\undefined_publisher.matcha-intellisense-0.0.1\\globals.d.lua"
+    ]
+}
