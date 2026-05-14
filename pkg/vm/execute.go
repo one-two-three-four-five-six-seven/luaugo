@@ -330,7 +330,22 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				L.stack[base+int(a)+1] = obj
 				ci.savedpc = pc
 				ci.top = L.top
-				L.stack[base+int(a)] = indexValue(L, obj, kv)
+				// Honor __namecall metamethod for non-table receivers
+				// (notably userdata; tables fall through to the
+				// regular __index lookup). Mirrors upstream
+				// lvmexecute.cpp::LOP_NAMECALL which probes
+				// fasttm(TM_NAMECALL) and uses its result directly.
+				// conformance/basic.luau:461 exercises this for a
+				// newproxy() userdata with __namecall=function.
+				if obj.tag != TTable {
+					if mm := L.gs.getTagMethodForValue(obj, TMNameCall); mm.tag != TNil {
+						L.stack[base+int(a)] = mm
+					} else {
+						L.stack[base+int(a)] = indexValue(L, obj, kv)
+					}
+				} else {
+					L.stack[base+int(a)] = indexValue(L, obj, kv)
+				}
 
 			case common.OpCall:
 				b := common.InsnB(insn)

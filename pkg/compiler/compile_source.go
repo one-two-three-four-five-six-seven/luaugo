@@ -6,24 +6,25 @@ package compiler
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/ast"
 	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
 
 // compileSource lexes, parses, and compiles source into a module.
+//
+// When the parser collects multiple errors via recovery, only the
+// first is surfaced through CompileError.Msg, matching upstream Luau
+// which aborts parsing at the first fatal error and reports a single
+// "<chunkid>:<line>: <msg>" string. Surfacing all recovered errors
+// would produce a "msg1; msg2; ..." string that confuses fixtures
+// such as conformance/basic.luau:596 which match against an exact
+// 'Incomplete statement: ...' suffix.
 func compileSource(chunkname string, source []byte, opts Options) (*bytecode.Module, error) {
 	res := ast.Parse(chunkname, source, ast.ParseOptions{})
 	if len(res.Errors) > 0 {
-		var b strings.Builder
-		for i, e := range res.Errors {
-			if i > 0 {
-				b.WriteString("; ")
-			}
-			b.WriteString(e.Msg)
-		}
-		return nil, &CompileError{Location: res.Errors[0].Location, Msg: b.String()}
+		first := res.Errors[0]
+		return nil, &CompileError{Location: first.Location, Msg: first.Msg}
 	}
 	if res.Program == nil {
 		return nil, &CompileError{Msg: "compiler: parser returned nil program"}
