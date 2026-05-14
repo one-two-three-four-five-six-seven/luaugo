@@ -68,24 +68,23 @@ foreach ($agent in $AgentIds) {
     # Commit inside the worktree (if not already).
     $status = git -C $work status --porcelain
     if ($status) {
-        git -C $work -c user.name="swarm-$agent" -c user.email="$agent@swarm.local" commit -m "swarm $agent: integration checkpoint" | Out-Null
+        $email = "${agent}@swarm.local"
+        $msg   = "swarm ${agent}: integration checkpoint"
+        git -C $work -c "user.name=swarm-${agent}" -c "user.email=${email}" commit -m $msg | Out-Null
     }
 
-    # Apply the worktree's HEAD commit onto master via patch.
-    $patch = git -C $work format-patch -1 --stdout HEAD
-    $tmp = [System.IO.Path]::GetTempFileName()
-    Set-Content -LiteralPath $tmp -Value $patch -Encoding ASCII
+    # Cherry-pick the worktree's HEAD commit onto master.
+    $branch = "swarm/$agent"
+    $sha = git -C $work rev-parse HEAD
+    Write-Host "[$agent] cherry-picking $sha from $branch"
 
-    Push-Location $repoRoot
-    try {
-        git apply --3way $tmp 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "[$agent] git apply failed; manual merge required. Patch saved at $tmp"
-            Pop-Location
-            continue
-        }
-    } finally {
-        Pop-Location
+    # Use --no-commit so we can integrate-test before committing.
+    & git -C $repoRoot cherry-pick --no-commit --strategy=recursive -X theirs $sha 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "[$agent] cherry-pick had conflicts; aborting"
+        & git -C $repoRoot cherry-pick --abort 2>&1 | Out-Null
+        & git -C $repoRoot reset --hard HEAD 2>&1 | Out-Null
+        continue
     }
 
     if (-not (Run-Tests $repoRoot)) {
@@ -96,9 +95,9 @@ foreach ($agent in $AgentIds) {
     }
 
     git -C $repoRoot add -A
-    git -C $repoRoot -c user.name="luaugo orchestrator" -c user.email="orchestrator@luaugo.local" commit -m "swarm: integrate agent $agent
-
-Files: $($changed -join ', ')" | Out-Null
+    $fileList = $changed -join ', '
+    $msg = "swarm: integrate agent ${agent}`n`nFiles: ${fileList}"
+    git -C $repoRoot -c "user.name=luaugo orchestrator" -c "user.email=orchestrator@luaugo.local" commit -m $msg | Out-Null
 
     Write-Host "[$agent] merged into master"
 }

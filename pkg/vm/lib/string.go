@@ -1186,16 +1186,36 @@ const (
 	kNop
 )
 
-func packReadDigits(fmtStr string, i int, def int) (int, int) {
+// packReadDigits parses an unsigned decimal at fmtStr[i]. When no
+// digit is present the default `def` is returned. The `over` flag is
+// reported when the parsed number exceeds packsizeMax (1GB) or would
+// have overflowed Go int during accumulation. Mirrors upstream
+// lstrlib's `getnum` for purposes of distinguishing "size too large"
+// from "out of limits".
+func packReadDigits(fmtStr string, i int, def int) (v int, ni int, over bool) {
 	if i >= len(fmtStr) || fmtStr[i] < '0' || fmtStr[i] > '9' {
-		return def, i
+		return def, i, false
 	}
-	v := 0
+	v = 0
 	for i < len(fmtStr) && fmtStr[i] >= '0' && fmtStr[i] <= '9' {
-		v = v*10 + int(fmtStr[i]-'0')
+		d := int(fmtStr[i] - '0')
+		// Detect signed-int overflow on the multiply or add.
+		if v > (int(^uint(0)>>1)-d)/10 {
+			over = true
+			// Consume the rest of the digit run so callers advance
+			// past the number cleanly.
+			for i < len(fmtStr) && fmtStr[i] >= '0' && fmtStr[i] <= '9' {
+				i++
+			}
+			return v, i, true
+		}
+		v = v*10 + d
 		i++
 	}
-	return v, i
+	if v > packsizeMax {
+		over = true
+	}
+	return v, i, over
 }
 
 func packOption(s *vm.State, h *packHeader, fmtStr string, i int) (packKind, int, int) {
@@ -1230,25 +1250,37 @@ func packOption(s *vm.State, h *packHeader, fmtStr string, i int) (packKind, int
 	case 'n':
 		return kFloat, 8, i
 	case 'i':
-		sz, ni := packReadDigits(fmtStr, i, 4)
+		sz, ni, over := packReadDigits(fmtStr, i, 4)
+		if over {
+			s.LError("size specifier is too large")
+		}
 		if sz <= 0 || sz > 16 {
 			s.LError("integral size (%d) out of limits [1,16]", sz)
 		}
 		return kInt, sz, ni
 	case 'I':
-		sz, ni := packReadDigits(fmtStr, i, 4)
+		sz, ni, over := packReadDigits(fmtStr, i, 4)
+		if over {
+			s.LError("size specifier is too large")
+		}
 		if sz <= 0 || sz > 16 {
 			s.LError("integral size (%d) out of limits [1,16]", sz)
 		}
 		return kUint, sz, ni
 	case 's':
-		sz, ni := packReadDigits(fmtStr, i, 4)
+		sz, ni, over := packReadDigits(fmtStr, i, 4)
+		if over {
+			s.LError("size specifier is too large")
+		}
 		if sz <= 0 || sz > 16 {
 			s.LError("integral size (%d) out of limits [1,16]", sz)
 		}
 		return kString, sz, ni
 	case 'c':
-		sz, ni := packReadDigits(fmtStr, i, -1)
+		sz, ni, over := packReadDigits(fmtStr, i, -1)
+		if over {
+			s.LError("size specifier is too large")
+		}
 		if sz == -1 {
 			s.LError("missing size for format option 'c'")
 		}
@@ -1271,7 +1303,10 @@ func packOption(s *vm.State, h *packHeader, fmtStr string, i int) (packKind, int
 		h.little = true
 		return kNop, 0, i
 	case '!':
-		ma, ni := packReadDigits(fmtStr, i, 8)
+		ma, ni, over := packReadDigits(fmtStr, i, 8)
+		if over {
+			s.LError("size specifier is too large")
+		}
 		if ma <= 0 || ma > 16 {
 			s.LError("integral size (%d) out of limits [1,16]", ma)
 		}
@@ -1333,7 +1368,13 @@ func packIntBytes(out []byte, n uint64, little bool, size int, neg bool) {
 	}
 }
 
-func unpackIntBytes(data string, off int, little bool, size int, signed bool) int64 {
+// unpackIntBytes reads `size` bytes starting at data[off] as either a
+// signed or unsigned little/big-endian integer and returns it as int64.
+// For sizes larger than 8 (the size of lua_Integer), it validates the
+// high bytes: they must be all 0 for non-negative values or all 0xff
+// for negative (sign-extended) signed values, otherwise the integer
+// "does not fit" into lua_Integer. Mirrors lstrlib.cpp `unpackint`.
+func unpackIntBytes(data string, off int, little bool, size int, signed bool) (int64, bool) {
 	var u uint64
 	limit := size
 	if limit > 8 {
@@ -1349,11 +1390,30 @@ func unpackIntBytes(data string, off int, little bool, size int, signed bool) in
 		}
 		u |= uint64(data[off+idx])
 	}
-	if size < 8 && signed {
-		mask := uint64(1) << uint(size*8-1)
-		u = (u ^ mask) - mask
+	if size < 8 {
+		if signed {
+			mask := uint64(1) << uint(size*8-1)
+			u = (u ^ mask) - mask
+		}
+	} else if size > 8 {
+		// Validate high bytes match the sign-extension pattern.
+		var mask byte
+		if signed && int64(u) < 0 {
+			mask = 0xff
+		}
+		for i := limit; i < size; i++ {
+			var idx int
+			if little {
+				idx = i
+			} else {
+				idx = size - 1 - i
+			}
+			if data[off+idx] != mask {
+				return 0, false
+			}
+		}
 	}
-	return int64(u)
+	return int64(u), true
 }
 
 func strPack(s *vm.State) int {
@@ -1470,6 +1530,12 @@ func strPack(s *vm.State) int {
 	return 1
 }
 
+// packsizeMax mirrors upstream's MAXSIZE for pack results: results
+// larger than 1GB must error with "format result too large". The
+// conformance test packsize("c1073741824") == 2^30 must be reachable
+// (i.e. the limit is INCLUSIVE of 2^30), but anything more must trip.
+const packsizeMax = 1 << 30
+
 func strPacksize(s *vm.State) int {
 	fmtStr := s.LCheckString(1)
 	h := initPackHeader()
@@ -1481,7 +1547,17 @@ func strPacksize(s *vm.State) int {
 		if kind == kString || kind == kZstr {
 			s.LArgError(1, "variable-length format")
 		}
-		totalSize += nAlign + size
+		// Detect overflow before accumulating, so we can report "too
+		// large" exactly like upstream lstrlib's `luaL_argcheck(L,
+		// size <= MAXSIZE - size_, ...)`. We compute the addition in
+		// a wider domain (int64) to avoid signed-int wrap on 32-bit
+		// arches; on 64-bit Go this is also fine because size and
+		// nAlign are bounded by the format syntax (each <=2^31).
+		add := int64(nAlign) + int64(size)
+		if int64(totalSize)+add > int64(packsizeMax) {
+			s.LArgError(1, "format result too large")
+		}
+		totalSize += int(add)
 	}
 	s.PushInteger(int64(totalSize))
 	return 1
@@ -1511,11 +1587,17 @@ func strUnpack(s *vm.State) int {
 		pos += nAlign
 		switch kind {
 		case kInt:
-			v := unpackIntBytes(data, pos, h.little, size, true)
+			v, ok := unpackIntBytes(data, pos, h.little, size, true)
+			if !ok {
+				s.LError("%d-byte integer does not fit into Lua Integer", size)
+			}
 			s.PushNumber(float64(v))
 			n++
 		case kUint:
-			v := unpackIntBytes(data, pos, h.little, size, false)
+			v, ok := unpackIntBytes(data, pos, h.little, size, false)
+			if !ok {
+				s.LError("%d-byte integer does not fit into Lua Integer", size)
+			}
 			s.PushNumber(float64(uint64(v)))
 			n++
 		case kFloat:
@@ -1542,7 +1624,10 @@ func strUnpack(s *vm.State) int {
 			s.PushString(data[pos : pos+size])
 			n++
 		case kString:
-			ln := unpackIntBytes(data, pos, h.little, size, false)
+			ln, ok := unpackIntBytes(data, pos, h.little, size, false)
+			if !ok {
+				s.LError("%d-byte integer does not fit into Lua Integer", size)
+			}
 			length := int(uint64(ln))
 			if length < 0 || pos+size+length > len(data) {
 				s.LArgError(2, "data string too short")
@@ -1560,6 +1645,7 @@ func strUnpack(s *vm.State) int {
 			}
 			s.PushString(data[pos : pos+end])
 			pos += end + 1
+			n++
 		case kPadAlign, kPadding, kNop:
 			// no value pushed
 		}

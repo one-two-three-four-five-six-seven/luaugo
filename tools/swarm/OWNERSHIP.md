@@ -34,9 +34,34 @@ Updated by the orchestrator at the start of each swarm. Empty when no
 swarm is running.
 
 ```
-swarm: (none active)
-baseline: (n/a)
-agents: []
+swarm: bug-fix-batch-2 (active)
+baseline: master @ 3e698b7
+agents:
+  - fix-basic:
+      target: tests/conformance/basic.luau move RUNTIME_ERR -> OK
+      worktree: .swarm/fix-basic
+      owned:
+        - pkg/vm/arith.go
+        - pkg/vm/compare.go
+        - pkg/vm/object.go
+        - pkg/vm/basic_fix_test.go (NEW)
+  - fix-tpack:
+      target: tests/conformance/tpack.luau move RUNTIME_ERR -> OK
+      worktree: .swarm/fix-tpack
+      owned:
+        - pkg/vm/lib/string.go
+        - pkg/vm/lib/string_pack_test.go (NEW)
+        - pkg/vm/lib/tpack_fix_test.go (NEW)
+  - fix-pcall-errors:
+      target: tests/conformance/pcall.luau and tests/conformance/errors.luau
+      worktree: .swarm/fix-pcall-errors
+      owned:
+        - pkg/vm/do.go
+        - pkg/vm/api.go
+        - pkg/vm/auxlib.go
+        - pkg/vm/lib/base.go
+        - pkg/vm/pcall_fix_test.go (NEW)
+        - pkg/vm/lib/errors_fix_test.go (NEW)
 ```
 
 ## Recent swarm history
