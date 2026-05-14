@@ -110,6 +110,13 @@ type globalState struct {
 	// instead of leaking. Indexed by *coroutine for O(1) registration
 	// and removal at finish-time.
 	liveCoroutines map[*coroutine]struct{}
+
+	// coverageHits records, per-proto, how many times each source
+	// line has been executed. Maintained by executeProto on every
+	// new line transition. Read by debug.getcoverage. nil until the
+	// first proto enters execution. We key by *bytecode.Proto since
+	// proto pointers are stable for the module's lifetime.
+	coverageHits map[*bytecode.Proto]map[int]int
 }
 
 // maxCoResumeDepth caps simultaneously-active nested coroutine

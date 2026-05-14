@@ -46,6 +46,20 @@ func reframeStack(L *stateImpl, base int, maxStack uint8) {
 // executeProto runs the bytecode of ci until the function returns,
 // yields, or raises an error. On normal return the results are placed
 // per the calling convention (see RETURN below).
+// bumpCoverage records a line-level hit for proto p so debug.getcoverage
+// can report it. Allocates lazily so non-instrumented runs pay nothing.
+func bumpCoverage(g *globalState, p *bytecode.Proto, line int) {
+	if g.coverageHits == nil {
+		g.coverageHits = make(map[*bytecode.Proto]map[int]int)
+	}
+	m := g.coverageHits[p]
+	if m == nil {
+		m = make(map[int]int)
+		g.coverageHits[p] = m
+	}
+	m[line]++
+}
+
 func executeProto(L *stateImpl, ci *callInfo) {
 	for {
 		// Re-fetch the live frame state on every reentry (after a
@@ -63,6 +77,12 @@ func executeProto(L *stateImpl, ci *callInfo) {
 		// register write into the current frame.
 		reframeStack(L, base, p.MaxStackSize)
 
+		// Coverage tracking: record this proto's executed lines.
+		// Only updates on line transitions so the per-opcode cost
+		// is essentially zero in the steady state. debug.getcoverage
+		// reads this map to report hit counts.
+		prevLine := -1
+
 		// Inner dispatch loop.
 	dispatch:
 		for {
@@ -74,6 +94,11 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				}
 				ci = L.currentFrame()
 				break dispatch
+			}
+			// Line-transition coverage hit.
+			if curLine := lineForPC(p, pc); curLine > 0 && curLine != prevLine {
+				bumpCoverage(L.gs, p, curLine)
+				prevLine = curLine
 			}
 			insn := code[pc]
 			pc++

@@ -75,7 +75,7 @@ func installConformanceShims(s *vm.State) {
 	// conformance/coverage.luau still fails on the asserts that read
 	// the returned data, but at least it doesn't nil-call.
 	s.Register("coverage", returnEmptyTable)
-	s.Register("getcoverage", returnEmptyTable)
+	s.Register("getcoverage", getCoverageImpl)
 
 	// ----- gc allocation gate ----------------------------------------
 	//
@@ -453,10 +453,43 @@ func returnTrue(s *vm.State) int {
 func noop(*vm.State) int { return 0 }
 
 // returnEmptyTable returns a fresh empty table. Sufficient for
-// `coverage()` and `getcoverage(fn)` where the only fail mode without
-// it is a nil-call.
+// `coverage()` where we don't model collection beyond what
+// getCoverageImpl reports.
 func returnEmptyTable(s *vm.State) int {
 	s.NewTable()
+	return 1
+}
+
+// getCoverageImpl implements debug.getcoverage(fn). Returns a sorted
+// array of records describing fn's bytecode coverage: one row per
+// closure (the root plus every nested closure in source order). Each
+// record carries .name / .linedefined / .depth fields plus a
+// per-line hit count (line keys map to integer counts; lines that
+// have an instruction but were never executed appear as 0).
+// Matches the shape upstream's conformance harness exposes in
+// Conformance.test.cpp via lua_getcoverage.
+func getCoverageImpl(s *vm.State) int {
+	if s.Type(1) != vm.TFunction {
+		s.LTypeError(1, "function")
+	}
+	records := s.Coverage(1)
+	s.NewTable()
+	for i, rec := range records {
+		s.NewTable()
+		if rec.Name != "" {
+			s.PushString(rec.Name)
+			s.SetField(-2, "name")
+		}
+		s.PushInteger(int64(rec.LineDefined))
+		s.SetField(-2, "linedefined")
+		s.PushInteger(int64(rec.Depth))
+		s.SetField(-2, "depth")
+		for line, count := range rec.Hits {
+			s.PushInteger(int64(count))
+			s.RawSetI(-2, line)
+		}
+		s.RawSetI(-2, i+1)
+	}
 	return 1
 }
 

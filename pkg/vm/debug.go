@@ -183,6 +183,96 @@ func (s *State) ClosureInfoAt(idx int) ClosureInfo {
 	return ci
 }
 
+// CoverageRecord is one row of a debug.getcoverage result: a closure
+// (named or anonymous) with its source location and a per-line hit
+// table. Mirrors upstream's "function info + per-line hits" shape
+// used by conformance/coverage.luau.
+type CoverageRecord struct {
+	Name        string      // closure debug name, empty for anonymous
+	LineDefined int         // 1-based source line of the function keyword
+	Depth       int         // nesting depth within the queried root
+	Hits        map[int]int // line -> hit count; zero-count entries are
+	// included for lines that have instructions but were never
+	// executed, so callers can distinguish "missed" from "absent"
+	// (conformance/coverage.luau:33 `stats[l] == 0` for misses).
+}
+
+// Coverage walks the closure value at idx (and all nested protos
+// it owns) and returns a depth-first preorder list of CoverageRecord
+// entries. The first record is always the root closure itself; nested
+// closures follow in source order. Lines that have at least one
+// instruction in the proto's bytecode appear in Hits with the recorded
+// count (zero for never-executed lines).
+//
+// Returns an empty slice if idx doesn't hold a Lua closure (Go closures
+// have no bytecode and therefore no coverage to report).
+func (s *State) Coverage(idx int) []CoverageRecord {
+	si := s.impl
+	i := si.absIndex(idx)
+	if i < 0 || i >= si.top {
+		return nil
+	}
+	v := si.stack[i]
+	if v.tag != TFunction || v.gc == nil {
+		return nil
+	}
+	cl, ok := v.gc.(*closure)
+	if !ok || cl == nil || cl.isGo || cl.proto == nil {
+		return nil
+	}
+	module := findModuleForProto(si.gs, cl.proto)
+	if module == nil {
+		return nil
+	}
+	var out []CoverageRecord
+	collectCoverage(si.gs, module, cl.proto, 0, &out)
+	return out
+}
+
+// collectCoverage emits records for `p` and recurses into its child
+// protos in source order. The depth parameter is incremented per
+// nesting level.
+func collectCoverage(g *globalState, m *bytecode.Module, p *bytecode.Proto, depth int, out *[]CoverageRecord) {
+	rec := CoverageRecord{
+		LineDefined: int(p.LineDefined),
+		Depth:       depth,
+		Hits:        map[int]int{},
+	}
+	if p.DebugName != 0 && int(p.DebugName) <= len(m.Strings) {
+		rec.Name = m.Strings[p.DebugName-1]
+	}
+	// Seed the line map with all lines that have at least one
+	// instruction: each such line starts at hit=0 so unexecuted
+	// lines surface as "missed" rather than "absent". The
+	// runtime-recorded hit count overrides on top.
+	if p.LineInfo != nil {
+		for pc := range p.Code {
+			if line := lineForPC(p, pc); line > 0 {
+				if _, present := rec.Hits[line]; !present {
+					rec.Hits[line] = 0
+				}
+			}
+		}
+	}
+	if hits := g.coverageHits[p]; hits != nil {
+		for line, count := range hits {
+			rec.Hits[line] = count
+		}
+	}
+	*out = append(*out, rec)
+
+	// Recurse into child protos in source order. m.Protos is the
+	// flat module-level array; the proto's Protos slice contains
+	// indices into it.
+	for _, childIdx := range p.Protos {
+		if int(childIdx) >= len(m.Protos) {
+			continue
+		}
+		child := m.Protos[childIdx]
+		collectCoverage(g, m, child, depth+1, out)
+	}
+}
+
 // ClosureName returns the registered debugName of the function value
 // at idx, or "" if the slot does not hold a Go closure with a
 // registered name. Mirrors the path lua_getinfo "n" takes when the
