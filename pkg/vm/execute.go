@@ -337,14 +337,29 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				// fasttm(TM_NAMECALL) and uses its result directly.
 				// conformance/basic.luau:461 exercises this for a
 				// newproxy() userdata with __namecall=function.
+				var resolved value
 				if obj.tag != TTable {
 					if mm := L.gs.getTagMethodForValue(obj, TMNameCall); mm.tag != TNil {
-						L.stack[base+int(a)] = mm
+						resolved = mm
 					} else {
-						L.stack[base+int(a)] = indexValue(L, obj, kv)
+						resolved = indexValue(L, obj, kv)
 					}
 				} else {
-					L.stack[base+int(a)] = indexValue(L, obj, kv)
+					resolved = indexValue(L, obj, kv)
+				}
+				L.stack[base+int(a)] = resolved
+				// If the resolved method is nil OR the receiver
+				// is a value type that can't carry methods (number,
+				// boolean, ...) and we end up with a nil here,
+				// raise the upstream-canonical "attempt to call
+				// missing method 'name' of T" error before the
+				// downstream CALL can produce a less informative
+				// "attempt to call a nil value". conformance/
+				// errors.luau:403-408 exercises this.
+				if resolved.tag == TNil {
+					methodName := kv.gc.(*tString).str()
+					typeName := obj.tag.String()
+					L.runtimeError("attempt to call missing method '" + methodName + "' of " + typeName)
 				}
 
 			case common.OpCall:
@@ -758,7 +773,19 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				stepN, ok2 := stepV.asNumber()
 				idxN, ok3 := idxV.asNumber()
 				if !ok1 || !ok2 || !ok3 {
-					L.runtimeError("'for' initial value must be a number")
+					// addErrorWhere reads ci.savedpc-1 to compute
+					// the current line; stash pc here so the prefix
+					// matches the FORNPREP source line.
+					ci.savedpc = pc
+				}
+				if !ok3 {
+					L.runtimeError("invalid 'for' initial value (number expected, got " + idxV.tag.String() + ")")
+				}
+				if !ok1 {
+					L.runtimeError("invalid 'for' limit (number expected, got " + limV.tag.String() + ")")
+				}
+				if !ok2 {
+					L.runtimeError("invalid 'for' step (number expected, got " + stepV.tag.String() + ")")
 				}
 				L.stack[base+int(a)] = numberValue(limN)
 				L.stack[base+int(a)+1] = numberValue(stepN)
@@ -1552,15 +1579,19 @@ func indexValue(L *stateImpl, t, k value) value {
 		// Non-table: invoke __index from per-type metatable.
 		mm := L.gs.getTagMethodForValue(t, TMIndex)
 		if mm.tag == TNil {
-			// Specialised message for vectors with an unknown
-			// component name, matching upstream's vector_index
-			// (VM/src/lveclib.cpp): "attempt to index vector with
-			// '<name>'". Falls back to the generic message for
-			// non-string keys and other types.
-			if t.tag == TVector && k.tag == TString {
-				L.runtimeError("attempt to index vector with '" + k.gc.(*tString).str() + "'")
+			// Mirror upstream luaG_indexerror (ldebug.cpp:286-296):
+			// emit "attempt to index T with 'K'" for short string
+			// keys, otherwise "attempt to index T with KTYPE".
+			// conformance/errors.luau:405 ("(42):foo()") relies on
+			// the string-key form.
+			t1 := t.tag.String()
+			if k.tag == TString {
+				keyStr := k.gc.(*tString).str()
+				if len(keyStr) <= 64 {
+					L.runtimeError("attempt to index " + t1 + " with '" + keyStr + "'")
+				}
 			}
-			L.runtimeError("attempt to index a " + t.tag.String() + " value")
+			L.runtimeError("attempt to index " + t1 + " with " + k.tag.String())
 		}
 		if mm.tag == TFunction {
 			return L.callIndexMeta(mm, t, k)

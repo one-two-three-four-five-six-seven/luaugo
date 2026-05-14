@@ -150,7 +150,27 @@ func (co *State) resumeImpl(from *State, nargs int) Status {
 	gs := co.impl.gs
 	if gs.resumeDepth >= maxCoResumeDepth {
 		errVal := stringValue(gs.intern("C stack overflow"))
-		co.impl.push(errVal)
+		// Push the error onto the resumer's stack so auxResume
+		// surfaces it via the standard error path. When invoked from
+		// the main thread (from == nil), fall back to co's stack.
+		if from != nil {
+			from.impl.push(errVal)
+		} else {
+			co.impl.push(errVal)
+		}
+		co.impl.status = StatusErrRun
+		return StatusErrRun
+	}
+	// If we're inside an xpcall error handler, propagate the
+	// C-stack-overflow context: resuming a fresh coroutine here must
+	// fail rather than succeed, because upstream's nCcalls bookkeeping
+	// has already exhausted the C-stack budget. conformance/errors.
+	// luau:236 creates an empty-body coroutine inside the xpcall
+	// handler and expects the resume to return false with "C stack
+	// overflow".
+	if from != nil && from.impl.inErrHandler > 0 {
+		errVal := stringValue(gs.intern("C stack overflow"))
+		from.impl.push(errVal)
 		co.impl.status = StatusErrRun
 		return StatusErrRun
 	}
