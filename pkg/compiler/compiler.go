@@ -791,28 +791,52 @@ func (c *compiler) compileRepeat(s *ast.StatRepeat) {
 		c.compileStat(stat)
 	}
 
-	// Close any upvalues captured into body locals before the
-	// back-edge: each iteration of `repeat` needs a fresh set of body
-	// locals. Emit BEFORE the continue-patch point so `continue` (which
-	// jumps to the until-check landing) skips this CLOSEUPVALS and the
-	// until expression still sees the body locals' open upvalues.
-	if !c.lastInsnIsUnreachableTerminator() && fc.pb.top > topBefore {
-		fc.pb.emitABC(common.OpCloseUpvals, topBefore, 0, 0)
-	}
-
-	// Patch continue jumps to the until check.
+	// Patch continue jumps to land at the until-check. Repeat..until
+	// in Luau preserves body locals into the until expression (see
+	// conformance/constructs.luau:253), so we do NOT close upvalues
+	// here -- a closure captured by the body must remain attached to
+	// its still-live stack slot when the until condition reads it.
 	for _, pc := range loop.continuePCs {
 		c.patchJumpTo(pc, fc.pb.pc())
 	}
 
-	// Compile until condition: if true, exit; if false, loop back.
-	// Use compileCondJump-like logic but with JUMPIFNOT to go back.
+	// Compile until condition. Whether the loop exits or loops back,
+	// we must CLOSEUPVALS before tearing down (or rebinding) the body
+	// locals so that closures captured during this iteration don't
+	// alias the slots that the next iteration -- or the post-loop
+	// code -- will reuse. conformance/basic.luau:904 requires this
+	// on the looping branch; the same closure-capture invariant
+	// matters on the exit branch when the loop body's last captured
+	// upvalue would otherwise survive into post-loop register reuse.
 	r := fc.pb.reserveReg(1)
 	c.compileExprToReg(s.Condition, r)
-	// JUMPIFNOT R, delta-to-loopStart
-	backPC := fc.pb.pc()
-	fc.pb.emitAD(common.OpJumpIfNot, r, int32(loopStart-backPC-1))
 	fc.pb.setTop(fc.pb.top - 1)
+	// JUMPIFNOT R, delta-to-loopStart -- loop back when the until
+	// condition is false. (Emit BEFORE the CLOSEUPVALS so the body
+	// locals are still live for the until expression; CLOSEUPVALS
+	// itself only detaches upvalues, leaving the stack values intact,
+	// so it doesn't matter that the read happened first.) The branch
+	// target is loopStart, but CLOSEUPVALS must execute on EITHER
+	// path before any subsequent register reuse, so we emit the
+	// CLOSEUPVALS on the fall-through (exit) path and a separate
+	// CLOSEUPVALS+JUMP on the back-edge.
+	condPC := fc.pb.pc()
+	fc.pb.emitAD(common.OpJumpIfNot, r, 0) // placeholder
+	// Fall-through path: loop exits. Close captured upvalues.
+	if fc.pb.top > topBefore {
+		fc.pb.emitABC(common.OpCloseUpvals, topBefore, 0, 0)
+	}
+	exitPC := fc.pb.pc()
+	fc.pb.emitAD(common.OpJump, 0, 0) // placeholder; jumps over the back-edge
+	// Back-edge path: close upvalues and loop back to loopStart.
+	c.patchJumpTo(condPC, fc.pb.pc())
+	if fc.pb.top > topBefore {
+		fc.pb.emitABC(common.OpCloseUpvals, topBefore, 0, 0)
+	}
+	backPC := fc.pb.pc()
+	fc.pb.emitAD(common.OpJump, 0, int32(loopStart-backPC-1))
+	// Past the back-edge: this is the loop-exit landing point.
+	c.patchJumpTo(exitPC, fc.pb.pc())
 
 	// Patch break jumps to here.
 	for _, pc := range loop.breakPCs {
