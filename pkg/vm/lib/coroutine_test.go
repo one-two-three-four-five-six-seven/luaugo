@@ -138,8 +138,11 @@ func TestCoroutineStatus(t *testing.T) {
 	if !s.IsNil(7) {
 		t.Errorf("main running(): want nil, got type %v", s.Type(7))
 	}
-	if s.ToBoolean(8) {
-		t.Errorf("main isyieldable: want false, got true")
+	// Main thread is reported as yieldable to match upstream's
+	// lua_isyieldable semantics (the conformance harness invokes the
+	// main chunk via lua_resume, which makes nCcalls == baseCcalls).
+	if !s.ToBoolean(8) {
+		t.Errorf("main isyieldable: want true, got false")
 	}
 }
 

@@ -136,14 +136,25 @@ func (s *stateImpl) callValue(funcIdx, nargs, nresults int) {
 			s.runtimeError("attempt to call a " + v.tag.String() + " value")
 		}
 		// Insert mm before funcIdx, push old value as first arg.
-		s.reserve(1)
-		// Shift args right by 1 to make room for the receiver.
-		copy(s.stack[funcIdx+1+1:s.top+1], s.stack[funcIdx+1:s.top])
+		// The shift moves the existing args block
+		//   [funcIdx+1 .. funcIdx+1+nargs)
+		// up by one slot. We must size the operation against `nargs`
+		// (the authoritative arg count for fixed-B calls) rather
+		// than against s.top, because OpCall does not always
+		// position s.top at funcIdx+1+nargs for fixed-B calls
+		// (events.luau:292 -- nested __call chains with fixed args).
+		argsEnd := funcIdx + 1 + nargs
+		need := argsEnd + 1
+		if need > len(s.stack) {
+			s.reserve(need - s.top)
+		}
+		copy(s.stack[funcIdx+2:argsEnd+1], s.stack[funcIdx+1:argsEnd])
 		s.stack[funcIdx+1] = v
 		s.stack[funcIdx] = mm
-		s.top++
-		s.stack = s.stack[:s.top]
 		nargs++
+		if argsEnd+1 > s.top {
+			s.top = argsEnd + 1
+		}
 		v = mm
 	}
 	cl := v.gc.(*closure)

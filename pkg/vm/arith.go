@@ -6,6 +6,7 @@
 package vm
 
 import (
+	"fmt"
 	"math"
 	"strings"
 )
@@ -199,6 +200,16 @@ func metamethodBase(s *stateImpl, fallback int) int {
 }
 
 // callUnaryTM is the unary version (for TMUnm, TMLen).
+//
+// Mirrors upstream luaV_dolen / luaV_doarith for TM_UNM: the
+// metamethod is called as mm(value, nil). The second argument is the
+// upstream "luaO_nilobject" placeholder; user-defined __len /__unm
+// functions ignore it. Passing the value twice (as we used to) made
+// callers like `__len = error` see error as `error(value, value)`
+// where the second value is interpreted as the level argument and
+// errored with "invalid argument #2 (integer expected, got table)"
+// before the error could surface the intended payload
+// (events.luau:403).
 func (s *stateImpl) callUnaryTM(a value, tm TM) (value, bool) {
 	mm := s.gs.getTagMethodForValue(a, tm)
 	if mm.tag == TNil {
@@ -215,7 +226,7 @@ func (s *stateImpl) callUnaryTM(a value, tm TM) (value, bool) {
 	}
 	s.push(mm)
 	s.push(a)
-	s.push(a) // upstream passes the value twice for unary ops on certain types; harmless and matches Lua 5.1
+	s.push(nilValue())
 	s.callValue(resBase, 2, 1)
 	r := s.stack[resBase]
 	if savedLen > s.top {
@@ -256,6 +267,7 @@ func (s *stateImpl) arithError(tm TM, b, c value) {
 }
 
 // doLen implements `#v`. Calls __len for tables/userdata when present.
+// Validates that __len returns a number, matching upstream luaV_dolen.
 func (s *stateImpl) doLen(v value) value {
 	switch v.tag {
 	case TString:
@@ -268,12 +280,18 @@ func (s *stateImpl) doLen(v value) value {
 		t := v.gc.(*table)
 		if t.metatable != nil {
 			if r, ok := s.callUnaryTM(v, TMLen); ok {
+				if r.tag != TNumber {
+					s.runtimeError("'__len' must return a number")
+				}
 				return r
 			}
 		}
 		return numberValue(float64(t.rawLen()))
 	}
 	if r, ok := s.callUnaryTM(v, TMLen); ok {
+		if r.tag != TNumber {
+			s.runtimeError("'__len' must return a number")
+		}
 		return r
 	}
 	s.runtimeError("attempt to get length of a " + v.tag.String() + " value")
@@ -283,58 +301,68 @@ func (s *stateImpl) doLen(v value) value {
 // doConcat concatenates the n top-of-stack values into one string,
 // leaving the result at base. Mirrors luaV_concat semantics with
 // __concat fallback.
+//
+// Algorithm matches upstream luaV_concat (lvmutils.cpp): operates
+// right-to-left. Each pass either collapses the rightmost pair via
+// __concat (shrinking total by 1) or collects a maximal contiguous
+// run of stringifiable values into one joined string. The
+// right-to-left order is essential so a non-string __concat result
+// (e.g. a table whose __concat returns another table) is paired
+// with the NEXT operand to its left on the next iteration, rather
+// than re-paired with the same left operand in an infinite loop
+// (events.luau:253 -- the originally-timing-out site).
 func (s *stateImpl) doConcat(base, n int) {
-	// Walk pairs from left to right.
 	if n < 2 {
 		return
 	}
-	// Convert to strings where possible; on failure, try __concat.
-	out := make([]string, 0, n)
-	i := 0
-	for i < n {
-		v := s.stack[base+i]
-		str, ok := v.asString()
-		if !ok {
-			// Try __concat: combine first contiguous string prefix into one
-			// then call __concat(prefix, v). Simpler: call __concat(left, right)
-			// where left is either accumulated prefix or s.stack[base+i-1].
-			var left value
-			if len(out) > 0 {
-				// Materialise accumulated prefix as a single string.
-				ts := s.gs.intern(strings.Join(out, ""))
-				left = stringValue(ts)
-				out = out[:0]
-			} else if i == 0 {
-				// First item not concatenable; try __concat on (v, next).
-				if i+1 >= n {
-					s.runtimeError("attempt to concatenate a " + v.tag.String() + " value")
-				}
-				r, ok := s.callBinTM(v, s.stack[base+i+1], TMConcat)
-				if !ok {
-					s.runtimeError("attempt to concatenate a " + v.tag.String() + " value")
-				}
-				// Replace pair with result and continue.
-				s.stack[base+i+1] = r
-				i++
-				continue
-			} else {
-				left = s.stack[base+i-1]
-			}
-			r, ok := s.callBinTM(left, v, TMConcat)
+	total := n
+	last := n - 1
+	for total > 1 {
+		topMinus1 := s.stack[base+last]
+		topMinus2 := s.stack[base+last-1]
+		_, lOK := topMinus2.asString()
+		_, rOK := topMinus1.asString()
+		if !lOK || !rOK {
+			r, ok := s.callBinTM(topMinus2, topMinus1, TMConcat)
 			if !ok {
-				s.runtimeError("attempt to concatenate a " + v.tag.String() + " value")
+				bad := topMinus2
+				if lOK {
+					bad = topMinus1
+				}
+				s.runtimeError("attempt to concatenate a " + bad.tag.String() + " value")
 			}
-			// Replace v with result and re-enter as a single string item.
-			s.stack[base+i] = r
-			// Loop again; the result may itself be a string, so it joins out.
+			s.stack[base+last-1] = r
+			s.stack[base+last] = nilValue()
+			last--
+			total--
 			continue
 		}
-		out = append(out, str)
-		i++
+		// Collect a maximal run of stringifiable values ending at `last`.
+		runLen := 2
+		ls, _ := topMinus2.asString()
+		rs, _ := topMinus1.asString()
+		parts := []string{ls, rs}
+		for runLen < total {
+			v := s.stack[base+last-runLen]
+			str, ok := v.asString()
+			if !ok {
+				break
+			}
+			parts = append([]string{str}, parts...)
+			runLen++
+		}
+		joined := strings.Join(parts, "")
+		ts := s.gs.intern(joined)
+		s.stack[base+last-runLen+1] = stringValue(ts)
+		for j := base + last - runLen + 2; j <= base+last; j++ {
+			s.stack[j] = nilValue()
+		}
+		last -= runLen - 1
+		total -= runLen - 1
 	}
-	res := strings.Join(out, "")
-	s.stack[base] = stringValue(s.gs.intern(res))
-	// Shrink the rest of the slots.
+	if last != 0 {
+		s.stack[base] = s.stack[base+last]
+	}
 	for j := base + 1; j < base+n; j++ {
 		s.stack[j] = nilValue()
 	}
@@ -342,8 +370,46 @@ func (s *stateImpl) doConcat(base, n int) {
 
 // runtimeError raises a Lua runtime error with the given message.
 // Carries Go panic semantics; pcall recovers it.
+//
+// Mirrors upstream ldebug.cpp pusherror: when the innermost call
+// frame is a Lua frame the message is prefixed with
+// "chunkname:line: "; otherwise the message is left bare. This
+// matches upstream behaviour where errors raised from C functions
+// (Go in our port) produce unprefixed messages, so fixtures like
+// events.luau:22 that assert on the exact error string pass.
 func (s *stateImpl) runtimeError(msg string) {
+	msg = s.addErrorWhere(msg)
 	panic(luaRTError{msg: msg, value: stringValue(s.gs.intern(msg))})
+}
+
+// addErrorWhere prepends "chunkname:line: " to msg using ONLY the
+// innermost call frame, mirroring upstream pusherror semantics.
+// Returns msg unchanged when the top frame is a Go closure or
+// when no debug info is available. Avoids duplicating an
+// already-present prefix (e.g. produced by LError on the same call
+// site).
+func (s *stateImpl) addErrorWhere(msg string) string {
+	if len(s.frames) == 0 {
+		return msg
+	}
+	ci := s.frames[len(s.frames)-1]
+	if ci == nil || ci.cl == nil || ci.cl.isGo || ci.cl.proto == nil {
+		return msg
+	}
+	p := ci.cl.proto
+	line := lineForPC(p, ci.savedpc-1)
+	if line <= 0 {
+		return msg
+	}
+	name := chunkNameForProto(s.gs, p)
+	if name == "" {
+		name = "?"
+	}
+	prefix := fmt.Sprintf("%s:%d: ", name, line)
+	if strings.HasPrefix(msg, prefix) {
+		return msg
+	}
+	return prefix + msg
 }
 
 // runtimeErrorValue raises a Lua error with the given Lua value.

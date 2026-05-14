@@ -5,7 +5,10 @@
 
 package vm
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // auxlib.go: luaL_* helpers exposed as *State methods. (Filename is
 // auxlib.go rather than aux.go because "aux" is a reserved DOS device
@@ -23,15 +26,56 @@ func (s *State) LError(format string, args ...any) {
 	s.impl.runtimeError(msg)
 }
 
-// LTypeError raises a type-mismatch error for argument argn.
+// LTypeError raises a type-mismatch error for argument argn. Mirrors
+// upstream luaL_typeerrorL: the message includes the name of the
+// currently-executing Go function (if registered through LRegister /
+// LRegisterList) and distinguishes between a missing argument (slot
+// past stack top) and one of the wrong type.
 func (s *State) LTypeError(argn int, tname string) {
-	got := s.Type(argn)
-	s.LError("invalid argument #%d (%s expected, got %s)", argn, tname, got.String())
+	fname := s.currentGoFuncName()
+	got := s.typeAt(argn)
+	if got == TNone {
+		if fname != "" {
+			s.LError("missing argument #%d to '%s' (%s expected)", argn, fname, tname)
+		} else {
+			s.LError("missing argument #%d (%s expected)", argn, tname)
+		}
+		return
+	}
+	if fname != "" {
+		s.LError("invalid argument #%d to '%s' (%s expected, got %s)", argn, fname, tname, got.String())
+	} else {
+		s.LError("invalid argument #%d (%s expected, got %s)", argn, tname, got.String())
+	}
 }
 
-// LArgError raises a generic argument error.
+// LArgError raises a generic argument error. Mirrors upstream
+// luaL_argerrorL, which includes the current function name when
+// available.
 func (s *State) LArgError(argn int, extramsg string) {
+	if fname := s.currentGoFuncName(); fname != "" {
+		s.LError("invalid argument #%d to '%s' (%s)", argn, fname, extramsg)
+		return
+	}
 	s.LError("invalid argument #%d (%s)", argn, extramsg)
+}
+
+// currentGoFuncName returns the registered debugName of the innermost
+// Go-closure frame, or "" if the current frame is a Lua function or
+// an unnamed Go closure.
+func (s *State) currentGoFuncName() string {
+	si := s.impl
+	for i := len(si.frames) - 1; i >= 0; i-- {
+		ci := si.frames[i]
+		if ci == nil || ci.cl == nil {
+			continue
+		}
+		if !ci.cl.isGo {
+			return ""
+		}
+		return ci.cl.debugName
+	}
+	return ""
 }
 
 // LCheckType verifies the value at argn has type t; raises otherwise.
@@ -118,6 +162,9 @@ func (s *State) LRegister(funcs map[string]GoFunction) {
 	}
 	for name, fn := range funcs {
 		s.PushGoFunction(fn, 0)
+		if c, ok := s.impl.stack[s.impl.top-1].gc.(*closure); ok {
+			c.debugName = name
+		}
 		s.SetField(-2, name)
 	}
 }
@@ -135,6 +182,12 @@ func (s *State) LRegisterList(entries []LFnEntry) {
 	}
 	for _, e := range entries {
 		s.PushGoFunction(e.Fn, 0)
+		// Tag the closure with its registered name so error messages
+		// (luaL_typeerrorL / luaL_argerrorL) can render
+		// "to '<name>'" prefixes that match upstream wording.
+		if c, ok := s.impl.stack[s.impl.top-1].gc.(*closure); ok {
+			c.debugName = e.Name
+		}
 		s.SetField(-2, e.Name)
 	}
 }
@@ -272,6 +325,20 @@ func (s *State) LToLString(idx int) string {
 		return "false"
 	case TNil:
 		return "nil"
+	case TVector:
+		// Upstream luaL_tolstring formats vectors by joining each
+		// component's luai_num2str representation with ", ". The
+		// number of components is fixed at compile time (3 or 4).
+		x, y, z, w, _ := s.toVector(idx)
+		parts := []string{
+			formatNumber(float64(x)),
+			formatNumber(float64(y)),
+			formatNumber(float64(z)),
+		}
+		if VectorComponents == 4 {
+			parts = append(parts, formatNumber(float64(w)))
+		}
+		return strings.Join(parts, ", ")
 	}
 	return fmt.Sprintf("%s: 0x%x", s.Type(idx).String(), s.ToPointer(idx))
 }

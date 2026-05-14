@@ -11,47 +11,65 @@ import "strings"
 // upstream lvmutils.cpp luaV_equalval, luaV_lessthan, luaV_lessequal.
 
 // equalVal implements `a == b` including __eq metamethod dispatch.
+//
+// Mirrors upstream luaV_equalval (lvmutils.cpp): for tables and
+// userdata, if a shared `__eq` metamethod exists between the two
+// operands (per get_compTM), the metamethod is consulted EVEN when
+// a and b are the same reference. The raw-equality shortcut only
+// applies for non-table / non-userdata tags, where no __eq applies.
+// This matches the events.luau:366 test case
+// (`assert(t ~= t)` with `__eq = print` returning a falsy value).
 func (s *stateImpl) equalVal(a, b value) bool {
-	// Cross-type: number vs integer would unify, but we only store TNumber.
 	if a.tag != b.tag {
 		return false
 	}
-	if rawEqual(a, b) {
-		return true
-	}
-	// __eq applies only for two tables or two userdata with the same
-	// metatable (upstream semantics).
 	switch a.tag {
 	case TTable:
 		ta := a.gc.(*table)
 		tb := b.gc.(*table)
-		var mm value
-		if ta.metatable != nil {
-			mm = s.gs.getTagMethod(ta.metatable, TMEq)
-		}
-		if mm.tag == TNil && tb.metatable != nil {
-			mm = s.gs.getTagMethod(tb.metatable, TMEq)
-		}
-		if mm.tag == TNil {
-			return false
+		mm, ok := s.getCompTM(ta.metatable, tb.metatable, TMEq)
+		if !ok {
+			return ta == tb
 		}
 		return s.callEqTM(mm, a, b)
 	case TUserdata:
 		ua := a.gc.(*userdata)
 		ub := b.gc.(*userdata)
-		var mm value
-		if ua.metatable != nil {
-			mm = s.gs.getTagMethod(ua.metatable, TMEq)
-		}
-		if mm.tag == TNil && ub.metatable != nil {
-			mm = s.gs.getTagMethod(ub.metatable, TMEq)
-		}
-		if mm.tag == TNil {
-			return false
+		mm, ok := s.getCompTM(ua.metatable, ub.metatable, TMEq)
+		if !ok {
+			return ua == ub
 		}
 		return s.callEqTM(mm, a, b)
 	}
-	return false
+	return rawEqual(a, b)
+}
+
+// getCompTM returns the shared metamethod `event` between mt1 and
+// mt2 if both have it and they match, mirroring upstream
+// lvmutils.cpp get_compTM. The second result is false if no
+// applicable metamethod can be used (caller falls back to raw eq).
+func (s *stateImpl) getCompTM(mt1, mt2 *table, event TM) (value, bool) {
+	if mt1 == nil {
+		return value{}, false
+	}
+	tm1 := s.gs.getTagMethod(mt1, event)
+	if tm1.tag == TNil {
+		return value{}, false
+	}
+	if mt1 == mt2 {
+		return tm1, true
+	}
+	if mt2 == nil {
+		return value{}, false
+	}
+	tm2 := s.gs.getTagMethod(mt2, event)
+	if tm2.tag == TNil {
+		return value{}, false
+	}
+	if rawEqual(tm1, tm2) {
+		return tm1, true
+	}
+	return value{}, false
 }
 
 func (s *stateImpl) callEqTM(mm value, a, b value) bool {
@@ -118,12 +136,18 @@ func (s *stateImpl) lessEqualVal(a, b value) bool {
 }
 
 // callOrderTM attempts to call an ordering metamethod on (a, b).
+// Mirrors upstream lvmutils.cpp call_orderTM: BOTH operands must
+// expose the same metamethod (by rawEqual) for the order op to
+// apply. Otherwise the caller raises an "attempt to compare" error.
+// This matches events.luau:265 (`not pcall(function() return c < d end)`)
+// where only `c` has a metatable with `__lt`.
 func (s *stateImpl) callOrderTM(a, b value, tm TM) (bool, bool) {
 	mm := s.gs.getTagMethodForValue(a, tm)
 	if mm.tag == TNil {
-		mm = s.gs.getTagMethodForValue(b, tm)
+		return false, false
 	}
-	if mm.tag == TNil {
+	mm2 := s.gs.getTagMethodForValue(b, tm)
+	if mm2.tag == TNil || !rawEqual(mm, mm2) {
 		return false, false
 	}
 	base := metamethodBase(s, s.top)

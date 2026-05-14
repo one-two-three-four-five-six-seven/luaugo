@@ -721,18 +721,93 @@ func executeProto(L *stateImpl, ci *callInfo) {
 					vmlog.V("stack", "OpForGLoop pre A=%d nvars=%d base=%d L.top=%d len(stack)=%d gen=%v",
 						a, nvars, base, L.top, len(L.stack), L.stack[base+int(a)].tag)
 				}
-				// Build call: push generator, state, control.
-				// Ensure the loop's register window covers R(A)..R(A+2).
-				// A prior callee (e.g. the iterator's previous return)
-				// can have shrunk L.stack to its L.top, leaving the
-				// slice too short to read R(A+1)/R(A+2) even though
-				// those slots are part of this frame's register
-				// window. reframeStack re-extends it.
-				if need := base + int(a) + 3; need > len(L.stack) {
-					reframeStack(L, base, p.MaxStackSize)
-					if need > len(L.stack) {
-						L.reserve(need - L.top)
+
+				// Builtin table iteration fast-path: FORGPREP planted
+				// ra=nil, ra+1=table, ra+2=lightuserdata(index). Walk
+				// the array then the hash portion. Mirrors upstream
+				// LOP_FORGLOOP's "fast-path: builtin table iteration".
+				gen := L.stack[base+int(a)]
+				if gen.tag == TNil && base+int(a)+1 < len(L.stack) && L.stack[base+int(a)+1].tag == TTable {
+					t := L.stack[base+int(a)+1].gc.(*table)
+					index := iterPosFrom(L.stack[base+int(a)+2])
+					sizearr := len(t.array)
+					// Clear extra variables when nvars > 2 (we always
+					// write the first two as key/value below).
+					for i := 2; i < nvars; i++ {
+						L.stack[base+int(a)+3+i] = nilValue()
 					}
+					// Advance index through array portion.
+					emitted := false
+					for index < sizearr {
+						e := t.array[index]
+						if e.tag != TNil {
+							L.stack[base+int(a)+2] = value{tag: TLightUserdata, ptr: tableIterPos(index + 1)}
+							L.stack[base+int(a)+3] = numberValue(float64(index + 1))
+							L.stack[base+int(a)+4] = e
+							pc += int(d)
+							emitted = true
+							break
+						}
+						index++
+					}
+					if !emitted {
+						// Advance index through hash portion.
+						hashStart := sizearr
+						for index < hashStart+len(t.nodes) {
+							n := &t.nodes[index-hashStart]
+							if n.val.tag != TNil {
+								L.stack[base+int(a)+2] = value{tag: TLightUserdata, ptr: tableIterPos(index + 1)}
+								L.stack[base+int(a)+3] = n.key
+								L.stack[base+int(a)+4] = n.val
+								pc += int(d)
+								emitted = true
+								break
+							}
+							index++
+						}
+					}
+					if !emitted {
+						// Loop exit: skip aux.
+						pc++
+					}
+					continue
+				}
+				// Stage the iterator call ABOVE the loop's register
+				// window R(A)..R(A+(2+nvars)). Using L.top directly
+				// was unsafe: a loop body's last operation can leave
+				// L.top pointing *inside* R(A)..R(A+2), so the
+				// subsequent push of [gen, state, control] would
+				// clobber the iterator state itself — the bug
+				// surfaced as "invalid key to 'next'" once R(A+2) was
+				// overwritten with R(A)'s function value.
+				//
+				// Floor L.top at base+a+3+nvars (one past the user
+				// variable window) before pushing so the staged call
+				// lives in fresh slots. Results come back at the
+				// staging position; we then copy them down into the
+				// user-variable slots R(A+3..A+3+nvars-1).
+				windowTop := base + int(a) + 3 + nvars
+				if windowTop < base+int(a)+3 {
+					windowTop = base + int(a) + 3
+				}
+				if L.top < windowTop {
+					if windowTop > len(L.stack) {
+						reframeStack(L, base, p.MaxStackSize)
+						if windowTop > len(L.stack) {
+							// Extend the slice (and underlying array
+							// if needed) to cover the new top.
+							if windowTop > cap(L.stack) {
+								grow := make([]value, windowTop, windowTop+windowTop/2+16)
+								copy(grow, L.stack)
+								L.stack = grow
+							} else {
+								L.stack = L.stack[:windowTop]
+							}
+						}
+					} else {
+						L.stack = L.stack[:windowTop]
+					}
+					L.top = windowTop
 				}
 				saveTop := L.top
 				L.push(L.stack[base+int(a)])
@@ -779,21 +854,23 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				d := common.InsnD(insn)
 				// Generic for prep: jumps forward to the FORGLOOP.
 				//
-				// Upstream FORGPREP_INEXT / FORGPREP_NEXT additionally
-				// raise "attempt to iterate over a ... value" when the
-				// generator slot R(A) is not a function (and is not a
-				// table that the builtin fast-path will accept). We
-				// don't implement the table fast-path yet (FORGLOOP
-				// always takes the function-call path), but we DO
-				// raise the type error so callers using pcall to
-				// detect bad iterables see the right message.
+				// Upstream LOP_FORGPREP behaviour (lvmexecute.cpp):
+				//   - R(A) is a function: leave as-is; FORGLOOP calls
+				//     it as gen(state, control).
+				//   - R(A) has __iter metamethod: invoke __iter(R(A))
+				//     and overwrite (R(A), R(A+1), R(A+2)) with the
+				//     three returned values.
+				//   - R(A) has __call: leave as-is; FORGLOOP will call
+				//     the table/userdata via __call.
+				//   - R(A) is a plain table: set up the builtin table
+				//     iteration: R(A)=nil, R(A+1)=table, R(A+2)=
+				//     lightuserdata-holding-index-0. FORGLOOP detects
+				//     ra=nil && ra+1=table and walks array+hash.
+				//   - Otherwise: error.
 				//
-				// FORGPREP (plain) additionally handles __iter and
-				// __call resolution before the loop body; we leave
-				// that to the FORGLOOP function-call path (callValue
-				// resolves __call automatically). For consistency we
-				// only error here on values that cannot be iterated at
-				// all.
+				// LOP_FORGPREP_INEXT / FORGPREP_NEXT (the ipairs/next
+				// fast-paths) only validate the function form here;
+				// FORGLOOP handles their builtin paths separately.
 				ra := L.stack[base+int(a)]
 				if ra.tag != TFunction {
 					switch op {
@@ -807,10 +884,73 @@ func executeProto(L *stateImpl, ci *callInfo) {
 							L.runtimeError("attempt to iterate over a " + ra.tag.String() + " value")
 						}
 					case common.OpForGPrep:
-						// Plain FORGPREP allows tables (__iter / __call)
-						// and userdata (__iter / __call). Otherwise the
-						// value is not iterable.
-						if ra.tag != TTable && ra.tag != TUserdata {
+						if ra.tag == TTable || ra.tag == TUserdata {
+							// Check for __iter / __call before falling
+							// back to the builtin table iteration.
+							iterMM := L.gs.getTagMethodForValue(ra, TMIter)
+							callMM := L.gs.getTagMethodForValue(ra, TMCall)
+							if iterMM.tag != TNil {
+								// Invoke __iter(ra) and place the three
+								// results into R(A), R(A+1), R(A+2).
+								// Mirror upstream lvmexecute.cpp
+								// LOP_FORGPREP: setobj2s(ra+1, ra);
+								// setobj2s(ra, fn); call(ra, 3).
+								base2 := base + int(a)
+								// Need at least 3 result slots and an
+								// extra one above (for the upcoming
+								// FORGLOOP staging area).
+								if need := base2 + 3; need > len(L.stack) {
+									reframeStack(L, base, p.MaxStackSize)
+									if need > len(L.stack) {
+										L.reserve(need - L.top)
+									}
+								}
+								L.stack[base2+1] = ra
+								L.stack[base2] = iterMM
+								savedTop := L.top
+								L.top = base2 + 2
+								if L.top > len(L.stack) {
+									L.reserve(L.top - len(L.stack))
+								} else {
+									L.stack = L.stack[:L.top]
+								}
+								ci.savedpc = pc
+								ci.top = L.top
+								// Call __iter(self): 1 arg, 3 results
+								// (iter, state, control).
+								L.callValue(base2, 1, 3)
+								reframeStack(L, base, p.MaxStackSize)
+								L.top = savedTop
+								if L.top > len(L.stack) {
+									L.reserve(L.top - len(L.stack))
+								} else {
+									L.stack = L.stack[:L.top]
+								}
+								// Upstream guards: if __iter returned
+								// nil at R(A) the FORGLOOP would try
+								// to call a nil value with a confusing
+								// stack; defer to that message rather
+								// than synthesising a new one so the
+								// conformance fixtures' pcall error
+								// strings stay aligned.
+								_ = L.stack[base2]
+							} else if callMM.tag != TNil {
+								// Leave R(A..A+2) as-is; FORGLOOP will
+								// invoke __call on each iteration.
+							} else if ra.tag == TTable {
+								// Plain table: set up builtin iteration.
+								// R(A) = nil, R(A+1) = the table,
+								// R(A+2) = lightuserdata(index=0).
+								base2 := base + int(a)
+								L.stack[base2+1] = ra
+								L.stack[base2] = nilValue()
+								L.stack[base2+2] = value{tag: TLightUserdata, ptr: tableIterPos(0)}
+							} else {
+								// Userdata with no __iter and no __call
+								// is not iterable.
+								L.runtimeError("attempt to iterate over a " + ra.tag.String() + " value")
+							}
+						} else {
 							L.runtimeError("attempt to iterate over a " + ra.tag.String() + " value")
 						}
 					}
@@ -1276,6 +1416,14 @@ func indexValue(L *stateImpl, t, k value) value {
 		// Non-table: invoke __index from per-type metatable.
 		mm := L.gs.getTagMethodForValue(t, TMIndex)
 		if mm.tag == TNil {
+			// Specialised message for vectors with an unknown
+			// component name, matching upstream's vector_index
+			// (VM/src/lveclib.cpp): "attempt to index vector with
+			// '<name>'". Falls back to the generic message for
+			// non-string keys and other types.
+			if t.tag == TVector && k.tag == TString {
+				L.runtimeError("attempt to index vector with '" + k.gc.(*tString).str() + "'")
+			}
 			L.runtimeError("attempt to index a " + t.tag.String() + " value")
 		}
 		if mm.tag == TFunction {
@@ -1304,7 +1452,12 @@ func vectorComponent(v value, name string) (value, bool) {
 	case "z", "Z":
 		return numberValue(float64(vec.Z)), true
 	case "w", "W":
-		return numberValue(float64(vec.W)), true
+		// `.w` exists only when the VM is built 4-wide (matches
+		// upstream's LUA_VECTOR_SIZE == 4 build).
+		if VectorComponents == 4 {
+			return numberValue(float64(vec.W)), true
+		}
+		return value{}, false
 	}
 	return value{}, false
 }
@@ -1432,4 +1585,21 @@ func findModuleForProto(g *globalState, p *bytecode.Proto) *bytecode.Module {
 		}
 	}
 	return nil
+}
+
+// tableIterPos encodes an iteration position into a light-userdata
+// `ptr` field. Mirrors upstream's `setpvalue(ra + 2, ..., LU_TAG_ITERATOR)`
+// use of a reinterpret-cast integer to indicate the next slot to inspect.
+func tableIterPos(i int) any { return i }
+
+// iterPosFrom recovers the iteration index stored by tableIterPos.
+// Returns 0 if the slot does not carry an int payload (defensive).
+func iterPosFrom(v value) int {
+	if v.tag != TLightUserdata {
+		return 0
+	}
+	if i, ok := v.ptr.(int); ok {
+		return i
+	}
+	return 0
 }

@@ -27,6 +27,10 @@ type closure struct {
 	// Go closures
 	goFn   GoFunction
 	upvals []value
+	// debugName is the registered name of a Go closure, used by
+	// luaL_typeerrorL-style error messages. Empty when unknown
+	// (anonymous Go closure not registered through LRegisterList).
+	debugName string
 
 	// Lua closures
 	upvalRefs []*upVal

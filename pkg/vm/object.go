@@ -8,6 +8,7 @@ package vm
 import (
 	"math"
 	"strconv"
+	"strings"
 )
 
 // value is the in-memory representation of a Lua value. It mirrors
@@ -201,7 +202,15 @@ func rawEqual(a, b value) bool {
 		// NaN != NaN per IEEE 754; Lua follows the same rule.
 		return a.num == b.num
 	case TVector:
-		return a.vec == b.vec
+		// Compare only the active components (W is junk in 3-wide
+		// builds). Mirrors upstream luaO_rawequalObj's vector path,
+		// which dispatches on LUA_VECTOR_SIZE. Bitwise equality (with
+		// IEEE NaN != NaN preserved) is intentional: a NaN W slot
+		// from a division-by-zero leak must not poison the result.
+		if VectorComponents == 4 {
+			return a.vec == b.vec
+		}
+		return a.vec[0] == b.vec[0] && a.vec[1] == b.vec[1] && a.vec[2] == b.vec[2]
 	case TLightUserdata:
 		return a.ptr == b.ptr && a.ltag == b.ltag
 	}
@@ -214,7 +223,16 @@ func rawEqual(a, b value) bool {
 	return false
 }
 
-// formatNumber mirrors upstream lua_Number2str: %.14g.
+// formatNumber mirrors upstream luai_num2str (VM/src/lnumprint.cpp).
+// Luau uses Schubfach to produce the shortest round-trippable decimal,
+// then chooses between fixed-point and scientific notation based on
+// the position of the decimal point:
+//   - fixed-point when the decimal exponent `dot` is in [-5, 21];
+//   - scientific notation otherwise (e+NN with 2+ digit exponent).
+//
+// We obtain the shortest-significant digits from strconv.AppendFloat
+// with 'e' format and precision -1 (Go's shortest round-trip), then
+// reformat to match Luau's exact spelling.
 func formatNumber(n float64) string {
 	if math.IsNaN(n) {
 		return "nan"
@@ -225,10 +243,116 @@ func formatNumber(n float64) string {
 	if math.IsInf(n, -1) {
 		return "-inf"
 	}
-	// strconv 'g' with -1 picks the shortest round-trippable form,
-	// which matches %.14g for the values produced by Luau bytecode.
-	s := strconv.FormatFloat(n, 'g', 14, 64)
+	// AppendFloat with 'e' / -1 yields "X.YYYe+NN" or "X.YYYe-NN"
+	// (or "Xe+NN" for single-digit mantissas, including "0e+00" and
+	// "-0e+00" for signed zero).
+	buf := strconv.AppendFloat(nil, n, 'e', -1, 64)
+	s := string(buf)
+
+	sign := ""
+	if len(s) > 0 && s[0] == '-' {
+		sign = "-"
+		s = s[1:]
+	}
+
+	eIdx := strings.IndexByte(s, 'e')
+	if eIdx < 0 {
+		// Shouldn't happen for the 'e' format; defensive fallback.
+		return sign + s
+	}
+	mantissa := s[:eIdx]
+	exp, err := strconv.Atoi(s[eIdx+1:])
+	if err != nil {
+		return sign + s
+	}
+
+	var digits string
+	var dot int // 1-based position of the decimal point relative to digits
+	if i := strings.IndexByte(mantissa, '.'); i >= 0 {
+		digits = mantissa[:i] + mantissa[i+1:]
+		dot = i + exp
+	} else {
+		digits = mantissa
+		dot = len(mantissa) + exp
+	}
+
+	// Zero (including -0): print "0" or "-0", matching upstream's
+	// printspecial / zero path before Schubfach (sign byte preserved).
+	if digits == "0" {
+		return sign + "0"
+	}
+
+	declen := len(digits)
+
+	if dot >= -5 && dot <= 21 {
+		// fixed-point
+		switch {
+		case dot <= 0:
+			// "0." + zeros + digits, then trim trailing zeros
+			var b strings.Builder
+			b.WriteString(sign)
+			b.WriteString("0.")
+			for i := 0; i < -dot; i++ {
+				b.WriteByte('0')
+			}
+			b.WriteString(digits)
+			return trimTrailingZerosAfterDot(b.String())
+		case dot >= declen:
+			// digits then zero-padding (integer form, no dot)
+			var b strings.Builder
+			b.WriteString(sign)
+			b.WriteString(digits)
+			for i := 0; i < dot-declen; i++ {
+				b.WriteByte('0')
+			}
+			return b.String()
+		default:
+			// dot in the middle of digits
+			out := sign + digits[:dot] + "." + digits[dot:]
+			return trimTrailingZerosAfterDot(out)
+		}
+	}
+
+	// scientific: "X.YYYYe+NN" with at least 2-digit exponent
+	var b strings.Builder
+	b.WriteString(sign)
+	b.WriteByte(digits[0])
+	if declen > 1 {
+		b.WriteByte('.')
+		b.WriteString(digits[1:])
+	}
+	mantStr := trimTrailingZerosAfterDot(b.String())
+	expSign := "+"
+	e := dot - 1
+	if e < 0 {
+		expSign = "-"
+		e = -e
+	}
+	// At least two exponent digits, like upstream printexp.
+	return mantStr + "e" + expSign + leftPad2(e)
+}
+
+// trimTrailingZerosAfterDot strips trailing zeros (and a dangling dot)
+// from a decimal string. Has no effect on strings without a '.'.
+func trimTrailingZerosAfterDot(s string) string {
+	if !strings.ContainsRune(s, '.') {
+		return s
+	}
+	for strings.HasSuffix(s, "0") {
+		s = s[:len(s)-1]
+	}
+	if strings.HasSuffix(s, ".") {
+		s = s[:len(s)-1]
+	}
 	return s
+}
+
+// leftPad2 formats a non-negative exponent with at least two digits.
+func leftPad2(n int) string {
+	if n < 10 {
+		return "0" + strconv.Itoa(n)
+	}
+	return strconv.Itoa(n)
 }
 
 func trimASCIISpace(s string) string {
