@@ -191,14 +191,22 @@ func baseGetFEnv(s *vm.State) int {
 	}
 	// Level 1 should be the caller of getfenv. Our top frame is the
 	// Go function we're currently inside, so level == frame count
-	// from the inside out.
-	if cIdx, ok := s.ClosureAtLevel(int(level) + 1); ok {
-		if envIdx, ok2 := s.ClosureEnvAt(cIdx); ok2 {
-			s.PushValue(envIdx)
-			return 1
-		}
+	// from the inside out. Upstream's getfunc -> lua_getinfo(level,
+	// "f") raises luaL_argerror(1, "invalid level") when the level
+	// is past the top of the call stack -- e.g.
+	// events.luau:487 `pcall(getfenv, 10) == false`. Mirror that.
+	cIdx, ok := s.ClosureAtLevel(int(level) + 1)
+	if !ok {
+		s.LArgError(1, "invalid level")
 	}
-	// Fallback: globals.
+	if envIdx, ok2 := s.ClosureEnvAt(cIdx); ok2 {
+		s.PushValue(envIdx)
+		return 1
+	}
+	// Frame exists but has no closure env (e.g. tail-called frame).
+	// Upstream's equivalent path raises; we fall back to globals to
+	// avoid pushing nil, matching pre-Luau-0.700 behavior. If a
+	// future fixture demands the error message, surface it then.
 	s.PushThreadGlobals()
 	return 1
 }
@@ -214,8 +222,15 @@ func baseSetFEnv(s *vm.State) int {
 	s.LCheckType(2, vm.TTable)
 
 	if s.IsFunction(1) {
+		// Upstream rejects C functions: lua_iscfunction(L, -2) ||
+		// lua_setfenv(L, -2) == 0 -> luaL_error. Mirror that so
+		// events.luau:488 `pcall(setfenv, setfenv, {}) == false`
+		// holds: passing a Go function as the target must raise.
+		if s.IsGoFunction(1) {
+			s.LError("'setfenv' cannot change environment of given object")
+		}
 		if !s.SetClosureEnvAt(1, 2) {
-			s.LError("'setfenv' could not change function environment")
+			s.LError("'setfenv' cannot change environment of given object")
 		}
 		s.PushValue(1)
 		return 1

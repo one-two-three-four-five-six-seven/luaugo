@@ -43,6 +43,26 @@ func (s *State) ClosureEnvAt(idx int) (envIdx int, ok bool) {
 	return si.top - si.callBase, true
 }
 
+// IsGoFunction reports whether the value at idx is a Go ("C") closure.
+// Returns false for Lua closures, non-function values, and empty
+// slots. Mirrors upstream's lua_iscfunction.
+func (s *State) IsGoFunction(idx int) bool {
+	si := s.impl
+	i := si.absIndex(idx)
+	if i < 0 || i >= si.top {
+		return false
+	}
+	v := si.stack[i]
+	if v.tag != TFunction || v.gc == nil {
+		return false
+	}
+	cl, ok := v.gc.(*closure)
+	if !ok || cl == nil {
+		return false
+	}
+	return cl.isGo
+}
+
 // SetClosureEnvAt sets the environment of the function at funcIdx to
 // the table at envIdx. Returns false if funcIdx does not hold a
 // function or envIdx does not hold a table. Neither slot is popped.

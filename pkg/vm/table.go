@@ -310,6 +310,16 @@ func (t *table) set(g *globalState, k, v value) {
 	if k.tag == TNumber && math.IsNaN(k.num) {
 		panic(luaError{message: "table index is NaN"})
 	}
+	// Upstream rejects vector keys with any NaN component (see
+	// VM/src/ltable.cpp::luaH_setvector). conformance/vector.luau:126
+	// asserts `pcall(function() t[vector.create(0/0, 2, 3)] = 1 end)
+	// == false`.
+	if k.tag == TVector {
+		v0, v1, v2, v3 := k.vec[0], k.vec[1], k.vec[2], k.vec[3]
+		if v0 != v0 || v1 != v1 || v2 != v2 || v3 != v3 {
+			panic(luaError{message: "table index is NaN"})
+		}
+	}
 	// Fast path: existing array slot.
 	if k.tag == TNumber {
 		if i, ok := tryArrayIndex(k.num); ok && i >= 1 && i <= len(t.array) {

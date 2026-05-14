@@ -36,11 +36,29 @@ func installConformanceShims(s *vm.State) {
 	//
 	// Upstream registers these to report whether the fixture is
 	// running under the native code generator. luaugo has no native
-	// codegen, so honesty dictates returning false. Most fixtures
-	// guard their native-only asserts with `not native_check or
-	// is_native_if_supported()` so this is the value they want.
+	// codegen.
+	//
+	//   is_native()                 -- "am I literally executing native
+	//                                  code right now?". Always false
+	//                                  for us; fixtures that rely on it
+	//                                  (native.luau, integers.luau)
+	//                                  inherently target the native
+	//                                  backend and are expected to fail.
+	//
+	//   is_native_if_supported()    -- upstream returns TRUE when
+	//                                  codegen is disabled, only
+	//                                  returning the actual native
+	//                                  status when codegen IS enabled.
+	//                                  See Conformance.test.cpp:1139.
+	//                                  Since luaugo has no codegen, the
+	//                                  upstream-equivalent answer is
+	//                                  unconditionally true. This makes
+	//                                  the standalone trailing
+	//                                  `assert(is_native_if_supported())`
+	//                                  in vector.luau / vector_library
+	//                                  pass cleanly.
 	s.Register("is_native", returnFalse)
-	s.Register("is_native_if_supported", returnFalse)
+	s.Register("is_native_if_supported", returnTrue)
 
 	// ----- debugger ---------------------------------------------------
 	//
@@ -270,10 +288,16 @@ func installConformanceShims(s *vm.State) {
 // shared shim helpers
 // ---------------------------------------------------------------------
 
-// returnFalse is the implementation for is_native and
-// is_native_if_supported.
+// returnFalse is the implementation for is_native.
 func returnFalse(s *vm.State) int {
 	s.PushBoolean(false)
+	return 1
+}
+
+// returnTrue is the implementation for is_native_if_supported, which
+// in upstream returns true whenever codegen is unavailable.
+func returnTrue(s *vm.State) int {
+	s.PushBoolean(true)
 	return 1
 }
 

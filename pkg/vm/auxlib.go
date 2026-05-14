@@ -192,6 +192,26 @@ func (s *State) LRegisterList(entries []LFnEntry) {
 	}
 }
 
+// LRegisterListAnon is like LRegisterList but does NOT tag the
+// registered closures with their table key as a debug name. This
+// matches upstream Luau call sites that use
+// lua_pushcfunction(L, fn, /*debugname=*/nullptr) -- most notably the
+// per-type method tables for vector, where errors raised from inside
+// vector:Dot() must read "missing argument #2 (vector expected)" with
+// no "to 'Dot'" prefix. Use this variant when registering methods that
+// will be dispatched via __index / __namecall on a userdata-like type
+// rather than via a globally-named function.
+func (s *State) LRegisterListAnon(entries []LFnEntry) {
+	if s.Top() == 0 || s.Type(-1) != TTable {
+		s.LError("LRegisterListAnon requires a table on top of the stack")
+	}
+	for _, e := range entries {
+		s.PushGoFunction(e.Fn, 0)
+		// Deliberately do NOT set c.debugName here.
+		s.SetField(-2, e.Name)
+	}
+}
+
 // LFindTable navigates a dotted path under the table at idx, creating
 // any missing subtables. Returns "" on success or the first segment
 // that already exists as a non-table.

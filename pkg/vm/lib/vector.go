@@ -385,7 +385,15 @@ func openVector(s *vm.State) {
 	// registry so vectorIndex can resolve method lookups without
 	// reconstructing closures on every access.
 	s.CreateTable(0, len(vectorMethods))
-	s.LRegisterList(vectorMethods)
+	// Use the anonymous registration variant so that errors raised
+	// from inside e.g. vector:Dot() omit the function-name prefix.
+	// Upstream registers these per-type methods via lua_pushcfunction
+	// with a NULL debug name (see VM/src/lvmtype.cpp), producing
+	// "missing argument #2 (vector expected)" rather than the
+	// luaL_register-style "missing argument #2 to 'Dot' (vector
+	// expected)". The conformance fixture vector.luau:105 hard-codes
+	// the un-prefixed form.
+	s.LRegisterListAnon(vectorMethods)
 	s.SetRegistryField(vectorMethodsRegKey)
 
 	// Build the metatable: { __index = vectorIndex }.
