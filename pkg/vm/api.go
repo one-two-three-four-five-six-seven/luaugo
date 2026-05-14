@@ -456,6 +456,19 @@ func (s *State) ToThread(idx int) *State {
 // Status returns the thread's last completion status.
 func (s *State) Status() Status { return s.impl.status }
 
+// ResetStatus clears the thread's recorded status to StatusOK and
+// drops any leftover error value from its stack. Used by
+// coroutine.close after it has surfaced the error to the caller, so
+// that subsequent close() calls report "(true, nil)" per upstream
+// semantics (conformance/coroutine.luau:358-359).
+func (s *State) ResetStatus() {
+	s.impl.status = StatusOK
+	if s.impl.top > 0 {
+		s.impl.stack = s.impl.stack[:0]
+		s.impl.top = 0
+	}
+}
+
 // XMove transfers n values from s to dst's stack.
 func (s *State) XMove(dst *State, n int) {
 	si := s.impl

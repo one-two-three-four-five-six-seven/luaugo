@@ -209,6 +209,10 @@ func coClose(s *vm.State) int {
 		} else {
 			s.PushString("coroutine error")
 		}
+		// Mark the coroutine as cleanly closed so subsequent
+		// close() calls return (true, nil) per upstream semantics
+		// (conformance/coroutine.luau:358-359).
+		co.ResetStatus()
 		return 2
 	}
 }
