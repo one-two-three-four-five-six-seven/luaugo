@@ -253,6 +253,10 @@ func (s *State) LCallMeta(idx int, event string) bool {
 // __tostring if present.
 func (s *State) LToLString(idx int) string {
 	if s.LCallMeta(idx, "__tostring") {
+		if s.Type(-1) != TString {
+			s.Pop(1)
+			s.impl.runtimeError("'__tostring' must return a string")
+		}
 		v, _ := s.ToString(-1)
 		s.Remove(-1)
 		return v

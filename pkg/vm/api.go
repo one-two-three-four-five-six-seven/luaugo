@@ -437,10 +437,11 @@ func (s *State) PushThread() bool {
 	return s.IsMainThread()
 }
 
-// IsYieldable reports whether the current thread can yield. A thread
-// can yield iff it is a coroutine (not the main thread). luaugo does
-// not currently support metamethod-yield bans, so this matches "not
-// the main thread".
+// IsYieldable reports whether the current thread can yield.
+//
+// A thread is yieldable iff it is a coroutine (not the main thread).
+// luaugo does not currently model metamethod-yield bans, so any
+// non-main thread is reported as yieldable.
 func (s *State) IsYieldable() bool {
 	return s.impl.co != nil
 }

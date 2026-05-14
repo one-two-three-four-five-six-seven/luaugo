@@ -134,11 +134,22 @@ func encodeProto(out []byte, p *Proto, version, typesversion uint8, opts EncodeO
 			return nil, fmt.Errorf("LineInfo.AbsLineInfo len=%d, want %d intervals",
 				len(p.LineInfo.AbsLineInfo), intervals)
 		}
+		// Per-instruction bytes: in-memory holds "delta from interval
+		// baseline" for each pc; wire format writes the byte-to-byte
+		// delta of that running offset. Mirror upstream
+		// BytecodeBuilder::writeLineInfo's third pass.
+		var lastOffset uint8
 		for _, b := range p.LineInfo.LineInfo {
-			out = append(out, byte(b))
+			cur := uint8(b)
+			out = append(out, cur-lastOffset)
+			lastOffset = cur
 		}
+		// Absolute baselines: in-memory holds absolute lines; wire
+		// writes the delta against the running last line.
+		var lastLine int32
 		for _, v := range p.LineInfo.AbsLineInfo {
-			out = binary.LittleEndian.AppendUint32(out, uint32(v))
+			out = binary.LittleEndian.AppendUint32(out, uint32(v-lastLine))
+			lastLine = v
 		}
 	} else {
 		out = append(out, 0)

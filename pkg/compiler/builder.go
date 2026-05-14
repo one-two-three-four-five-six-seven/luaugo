@@ -80,6 +80,18 @@ type protoBuilder struct {
 	isVararg    bool
 	lineDefined uint32
 	debugName   uint32
+
+	// currentLine is the 1-based source line that subsequent emit*
+	// calls will attribute to. Set by the statement/expression
+	// compiler at the start of each AST node via setLine.
+	currentLine int
+
+	// lines is parallel to code: lines[i] is the 1-based source line
+	// for instruction word code[i]. AUX words receive the same line
+	// as the parent instruction so that line lookups by pc work
+	// uniformly regardless of whether pc points at a primary opcode
+	// or its AUX.
+	lines []int
 }
 
 func newProtoBuilder(parent *builder) *protoBuilder {
@@ -118,25 +130,46 @@ func (p *protoBuilder) setTop(t uint8) {
 // pc returns the current instruction word count.
 func (p *protoBuilder) pc() int { return len(p.code) }
 
+// setLine records the 1-based source line to attribute to subsequent
+// emit* calls. Callers convert from AST Position (0-based) by adding 1.
+// A value of 0 leaves currentLine unchanged so callers that have no
+// useful location (synthesized helper instructions) inherit the
+// enclosing statement's line.
+func (p *protoBuilder) setLine(line int) {
+	if line > 0 {
+		p.currentLine = line
+	}
+}
+
+// appendLine pushes p.currentLine onto p.lines, growing it to track
+// len(p.code). Called by every emit* helper.
+func (p *protoBuilder) appendLine() {
+	p.lines = append(p.lines, p.currentLine)
+}
+
 // emitABC appends an ABC-encoded instruction.
 func (p *protoBuilder) emitABC(op common.Opcode, a, b, c uint8) {
 	p.code = append(p.code, common.EncodeABC(op, a, b, c))
+	p.appendLine()
 }
 
 // emitAD appends an AD-encoded instruction.
 func (p *protoBuilder) emitAD(op common.Opcode, a uint8, d int32) {
 	p.code = append(p.code, common.EncodeAD(op, a, d))
+	p.appendLine()
 }
 
 // emitE appends an E-encoded instruction.
 func (p *protoBuilder) emitE(op common.Opcode, e int32) {
 	p.code = append(p.code, common.EncodeE(op, e))
+	p.appendLine()
 }
 
 // emitAux appends a raw AUX word that always follows the previous
-// instruction.
+// instruction. Inherits currentLine.
 func (p *protoBuilder) emitAux(w uint32) {
 	p.code = append(p.code, w)
+	p.appendLine()
 }
 
 // patchD rewrites the D field of the instruction at pc to delta.
@@ -253,5 +286,101 @@ func (p *protoBuilder) build(numUpvalues uint8, typeInfo []byte) *bytecode.Proto
 		Protos:       p.childProtos,
 		LineDefined:  p.lineDefined,
 		DebugName:    p.debugName,
+		LineInfo:     buildLineInfo(p.code, p.lines),
 	}
+}
+
+// buildLineInfo packs the parallel line slice into a bytecode.LineInfo
+// using upstream's algorithm in BytecodeBuilder::writeLineInfo. The
+// in-memory form returned here matches what upstream's lvmload
+// computes: AbsLineInfo holds the absolute baseline line per interval,
+// LineInfo holds (actualLine - baseline) per instruction so that
+// AbsLineInfo[pc>>LineGapLog2] + LineInfo[pc] reconstructs the source
+// line (see pkg/vm/debug.go lineForPC).
+//
+// Returns nil when there is no code, leaving the proto's LineInfo
+// section absent (which the encoder will write as a single 0 flag byte).
+func buildLineInfo(code []uint32, lines []int) *bytecode.LineInfo {
+	if len(code) == 0 || len(lines) != len(code) {
+		return nil
+	}
+
+	// First pass: determine span size such that every line in each
+	// span fits in an 8-bit delta from the span's minimum.
+	span := 1 << 24
+	for offset := 0; offset < len(lines); offset += span {
+		next := offset
+		mn := lines[offset]
+		mx := lines[offset]
+		for ; next < len(lines) && next < offset+span; next++ {
+			if lines[next] < mn {
+				mn = lines[next]
+			}
+			if lines[next] > mx {
+				mx = lines[next]
+			}
+			if mx-mn > 255 {
+				break
+			}
+		}
+		if next < len(lines) && next-offset < span {
+			// Shrink span to a power of two ≤ (next-offset).
+			span = 1 << ilog2(next-offset)
+		}
+	}
+
+	logspan := uint8(ilog2(span))
+	intervals := ((len(lines) - 1) >> logspan) + 1
+
+	// Second pass: compute baseline (minimum line) per interval.
+	baseline := make([]int32, intervals)
+	for offset := 0; offset < len(lines); offset += span {
+		mn := lines[offset]
+		next := offset
+		for ; next < len(lines) && next < offset+span; next++ {
+			if lines[next] < mn {
+				mn = lines[next]
+			}
+		}
+		baseline[offset/span] = int32(mn)
+	}
+
+	// Per-instruction deltas from baseline. Stored in the in-memory
+	// form (absolute baseline + delta), which is what upstream's
+	// lvmload yields after summing the wire bytes.
+	deltas := make([]int8, len(lines))
+	for i, ln := range lines {
+		d := int32(ln) - baseline[i>>logspan]
+		// LUAU_ASSERT in upstream: 0 <= d <= 255. Our span-shrinking
+		// guarantees this, but clamp defensively just in case a caller
+		// emitted a wildly out-of-range line.
+		if d < 0 {
+			d = 0
+		}
+		if d > 255 {
+			d = 255
+		}
+		// Store as signed int8 (uint8 wire form re-interpreted on read).
+		deltas[i] = int8(uint8(d))
+	}
+
+	return &bytecode.LineInfo{
+		LineGapLog2: logspan,
+		AbsLineInfo: baseline,
+		LineInfo:    deltas,
+	}
+}
+
+// ilog2 returns floor(log2(n)) for n >= 1. Matches upstream
+// Common::log2's behaviour for positive ints.
+func ilog2(n int) int {
+	if n < 1 {
+		return 0
+	}
+	r := 0
+	for n > 1 {
+		n >>= 1
+		r++
+	}
+	return r
 }

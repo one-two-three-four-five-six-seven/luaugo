@@ -313,24 +313,37 @@ func decodeProto(r *reader, version, typesversion uint8) (*Proto, error) {
 		intervals := int(((sizecode - 1) >> gapLog2) + 1)
 		li := &LineInfo{LineGapLog2: gapLog2}
 
-		// Per-instruction delta bytes.
+		// Per-instruction line bytes. The wire format is doubly delta-
+		// encoded: each byte is the delta from the previous byte's
+		// running offset, and the running offset is the delta from
+		// the interval baseline. Upstream's lvmload sums the running
+		// offset (lastoffset += byte) then stores that as
+		// lineinfo[pc]; we do the same so the in-memory form is
+		// "delta from baseline" (matching upstream Proto::lineinfo).
 		rawDeltas, err := r.bytes(int(sizecode))
 		if err != nil {
 			return nil, err
 		}
 		li.LineInfo = make([]int8, sizecode)
+		var lastOffset uint8
 		for k, b := range rawDeltas {
-			li.LineInfo[k] = int8(b)
+			lastOffset += b
+			li.LineInfo[k] = int8(lastOffset)
 		}
 
-		// Absolute line table (delta-encoded against running last line).
+		// Absolute line table is delta-encoded against running last
+		// line. Upstream's lvmload sums these into absolute lines;
+		// matching that, our in-memory AbsLineInfo holds the absolute
+		// baseline for each interval (matching upstream Proto::abslineinfo).
 		li.AbsLineInfo = make([]int32, intervals)
+		var lastLine int32
 		for k := 0; k < intervals; k++ {
 			v, err := r.int32LE()
 			if err != nil {
 				return nil, err
 			}
-			li.AbsLineInfo[k] = v
+			lastLine += v
+			li.AbsLineInfo[k] = lastLine
 		}
 
 		p.LineInfo = li

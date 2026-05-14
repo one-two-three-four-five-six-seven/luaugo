@@ -162,13 +162,30 @@ func strRep(s *vm.State) int {
 		s.PushString("")
 		return 1
 	}
+	const maxStrSize = 1 << 30
+	lenStr := len(str)
+	lenSep := len(sep)
+	// Bail out cheaply for any product that would obviously overflow
+	// or exceed the per-string size limit, before allocating anything.
+	// We compute `lenStr*n + lenSep*(n-1)` defensively to avoid signed
+	// 64-bit overflow on 64-bit ints and to refuse multi-GB strings
+	// the way upstream lstrlib's luaL_addsize check does.
+	if n > 0 && lenStr > maxStrSize/n {
+		s.LError("resulting string too large")
+		return 0
+	}
 	if sep == "" {
 		s.PushString(strings.Repeat(str, n))
 		return 1
 	}
-	total := len(str)*n + len(sep)*(n-1)
-	if total > (1 << 30) {
+	if n > 1 && lenSep > maxStrSize/(n-1) {
 		s.LError("resulting string too large")
+		return 0
+	}
+	total := lenStr*n + lenSep*(n-1)
+	if total < 0 || total > maxStrSize {
+		s.LError("resulting string too large")
+		return 0
 	}
 	var b strings.Builder
 	b.Grow(total)
@@ -722,6 +739,11 @@ func pushCaptures(s *vm.State, ms *matchState, sStart, sEnd int) int {
 	}
 	for i := 0; i < nlevels; i++ {
 		pushOneCapture(s, ms, i, sStart, sEnd)
+		if ms.err != "" {
+			// Stop pushing partial captures; caller will surface the
+			// error after rolling back the stack.
+			return i
+		}
 	}
 	return nlevels
 }
@@ -774,9 +796,17 @@ func findOrMatchAux(s *vm.State, find bool) int {
 			if find {
 				s.PushInteger(int64(s1 + 1))
 				s.PushInteger(int64(res))
-				return pushCaptures(s, &ms, -1, 0) + 2
+				nc := pushCaptures(s, &ms, -1, 0)
+				if ms.err != "" {
+					s.LError("%s", ms.err)
+				}
+				return nc + 2
 			}
-			return pushCaptures(s, &ms, s1, res)
+			nc := pushCaptures(s, &ms, s1, res)
+			if ms.err != "" {
+				s.LError("%s", ms.err)
+			}
+			return nc
 		}
 		s1++
 		if s1 > ms.srcEnd || anchor {
@@ -814,7 +844,12 @@ func strGmatch(s *vm.State) int {
 				} else {
 					pos = e
 				}
-				return pushCaptures(s, &ms, start, e)
+				nc := pushCaptures(s, &ms, start, e)
+				if ms.err != "" {
+					s.LError("%s", ms.err)
+					return 0
+				}
+				return nc
 			}
 			pos++
 		}
@@ -859,21 +894,25 @@ func strGsub(s *vm.State) int {
 		if e >= 0 {
 			n++
 			gsubAddValue(s, &ms, &b, srcPos, e, repType)
-			if e > srcPos {
-				srcPos = e
-			} else {
-				if srcPos < ms.srcEnd {
-					b.WriteByte(ms.src[srcPos])
-				}
-				srcPos++
+			if ms.err != "" {
+				s.LError("%s", ms.err)
 			}
+		}
+		// Advance the source position. Mirrors upstream:
+		//   if (e && e > src) src = e;
+		//   else if (src < ms.src_end) addchar(*src++);
+		//   else break;
+		// Importantly, when match terminates AT src_end we must
+		// break out, not run another iteration with srcPos beyond
+		// src_end (which would index out of bounds in subsequent
+		// pattern operations such as %f).
+		if e >= 0 && e > srcPos {
+			srcPos = e
+		} else if srcPos < ms.srcEnd {
+			b.WriteByte(ms.src[srcPos])
+			srcPos++
 		} else {
-			if srcPos < ms.srcEnd {
-				b.WriteByte(ms.src[srcPos])
-				srcPos++
-			} else {
-				break
-			}
+			break
 		}
 		if anchor {
 			break
@@ -1019,8 +1058,23 @@ func strFormat(s *vm.State) int {
 		}
 		switch conv {
 		case 'c':
+			// Lua's %c emits a single raw byte (NOT a UTF-8 rune like
+			// Go's fmt.Sprintf("%c",...) does). Width/flag handling
+			// (e.g. "%5c") still applies, but the produced character
+			// is the raw byte value modulo 256.
 			n := s.LCheckInteger(arg)
-			b.WriteString(fmt.Sprintf("%"+spec+"c", int(n)))
+			if n < 0 || n > 255 {
+				s.LError("bad argument #%d to 'format' (value out of range)", arg)
+				return 0
+			}
+			ch := byte(n)
+			if spec == "" {
+				b.WriteByte(ch)
+			} else {
+				// Render via %s with the same flag/width spec to honor
+				// alignment without re-interpreting the byte as a rune.
+				b.WriteString(fmt.Sprintf("%"+spec+"s", string([]byte{ch})))
+			}
 		case 'd', 'i':
 			n := s.LCheckInteger(arg)
 			b.WriteString(fmt.Sprintf("%"+spec+"d", n))

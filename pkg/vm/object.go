@@ -105,19 +105,65 @@ func (v value) asString() (string, bool) {
 }
 
 // asNumber returns v as a float64, coercing numeric strings.
+//
+// String coercion follows Luau's number lexer (luaO_str2d): decimal
+// literals, plus `0x`/`0X` hexadecimal and `0b`/`0B` binary integer
+// literals, with optional leading sign and surrounding ASCII space.
+// This matches lua_tonumber on the upstream VM, which is what
+// luaL_checknumber (and luaL_checkunsigned, used by bit32) consult.
 func (v value) asNumber() (float64, bool) {
 	switch v.tag {
 	case TNumber:
 		return v.num, true
 	case TString:
-		s := v.gc.(*tString).str()
-		n, err := strconv.ParseFloat(trimASCIISpace(s), 64)
+		return strToNumber(v.gc.(*tString).str())
+	}
+	return 0, false
+}
+
+// strToNumber parses s into a float64 using Luau's number-lexer
+// semantics. Returns false if the entire trimmed string is not a
+// well-formed Luau numeric literal. Mirrors upstream luaO_str2d /
+// the lexer paths for NUMBER_HEX and NUMBER_BINARY.
+func strToNumber(in string) (float64, bool) {
+	s := trimASCIISpace(in)
+	if s == "" {
+		return 0, false
+	}
+	sign := 1.0
+	switch s[0] {
+	case '+':
+		s = s[1:]
+	case '-':
+		sign = -1
+		s = s[1:]
+	}
+	if s == "" {
+		return 0, false
+	}
+	// Hex literal: `0x...` / `0X...`. strconv.ParseFloat does not
+	// accept hex without an exponent, so do the integer parse ourselves
+	// (Luau's number lexer treats `0x` as an unsigned integer literal).
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		n, err := strconv.ParseUint(s[2:], 16, 64)
 		if err != nil {
 			return 0, false
 		}
-		return n, true
+		return sign * float64(n), true
 	}
-	return 0, false
+	// Binary literal: `0b...` / `0B...`. Luau-specific extension.
+	if len(s) > 2 && s[0] == '0' && (s[1] == 'b' || s[1] == 'B') {
+		n, err := strconv.ParseUint(s[2:], 2, 64)
+		if err != nil {
+			return 0, false
+		}
+		return sign * float64(n), true
+	}
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, false
+	}
+	return sign * n, true
 }
 
 // asInteger returns v as an int64. Floats are accepted iff they

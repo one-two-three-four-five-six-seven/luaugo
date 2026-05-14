@@ -550,3 +550,64 @@ func TestBit32Byteswap(t *testing.T) {
 		t.Errorf("e2e byteswap: got %v want %v", got, float64(0x78563412))
 	}
 }
+
+// ----------------------------------------------------------------------
+// TestBit32StringCoercion
+//
+// Upstream Luau's bit32.* operations consume their numeric arguments
+// via luaL_checkunsigned, which calls lua_tointeger, which falls back
+// to luaO_str2d for string operands. That lexer accepts decimal, `0x`
+// hex, and `0b` binary literals (with optional sign / whitespace). Our
+// VM had only ParseFloat in value.asNumber(), which silently fails on
+// hex strings and caused tests/conformance/bitwise.luau to die at the
+// first `bit32.lrotate("0x12345678", 4)` assertion.
+//
+// This test locks in the corrected behaviour: bit32.* must accept
+// numeric strings in every shape Luau's number lexer accepts.
+// ----------------------------------------------------------------------
+
+func TestBit32StringCoercion(t *testing.T) {
+	cases := []struct {
+		src  string
+		want float64
+	}{
+		// Hex strings (the original regression).
+		{`return bit32.lrotate("0x12345678", 4)`, 0x23456781},
+		{`return bit32.rrotate("0x12345678", -4)`, 0x23456781},
+		{`return bit32.band("0xff", "0x0f")`, 0x0f},
+		{`return bit32.bor("0xf0", "0x0f")`, 0xff},
+		{`return bit32.bxor("0xff", "0x0f")`, 0xf0},
+		{`return bit32.byteswap("0xa1b2c3d4")`, 0xd4c3b2a1},
+		// Plain decimal strings still work.
+		{`return bit32.bnot("1")`, 0xfffffffe},
+		{`return bit32.band("1", 3)`, 1},
+		{`return bit32.band(1, "3")`, 1},
+		{`return bit32.band(1, 3, "5")`, 1},
+		{`return bit32.bor("1", 2)`, 3},
+		{`return bit32.bxor("1", 3)`, 2},
+		{`return bit32.countlz("42")`, 26},
+		{`return bit32.countrz("42")`, 1},
+		{`return bit32.extract("42", 1, 3)`, 5},
+		// Signed decimal: arshift("-1", n) - "-1" -> 0xffffffff after
+		// unsigned reduction, then the sign bit forces an arithmetic
+		// shift filling with 1s.
+		{`return bit32.arshift("-1", 1)`, 0xffffffff},
+		{`return bit32.arshift("-1", 32)`, 0xffffffff},
+		// Binary literal coercion (Luau extension).
+		{`return bit32.band("0b1100", "0b1010")`, 0b1000},
+	}
+	for _, c := range cases {
+		got := runBit32(t, c.src)
+		if got != c.want {
+			t.Errorf("%s: got %v (%#x), want %v (%#x)",
+				c.src, got, uint32(got), c.want, uint32(c.want))
+		}
+	}
+	// btest with a string operand should still return a boolean.
+	if !runBit32Bool(t, `return bit32.btest("1", 3)`) {
+		t.Error(`bit32.btest("1", 3): expected true`)
+	}
+	if !runBit32Bool(t, `return bit32.btest(1, "3")`) {
+		t.Error(`bit32.btest(1, "3"): expected true`)
+	}
+}

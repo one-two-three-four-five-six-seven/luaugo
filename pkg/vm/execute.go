@@ -1351,12 +1351,7 @@ func newIndexValue(L *stateImpl, t, k, v value) {
 				return
 			}
 			if mm.tag == TFunction {
-				base := L.top
-				L.push(mm)
-				L.push(t)
-				L.push(k)
-				L.push(v)
-				L.callValue(base, 3, 0)
+				callNewIndexMeta(L, mm, t, k, v)
 				return
 			}
 			t = mm
@@ -1367,29 +1362,41 @@ func newIndexValue(L *stateImpl, t, k, v value) {
 			L.runtimeError("attempt to index a " + t.tag.String() + " value")
 		}
 		if mm.tag == TFunction {
-			base := metamethodBase(L, L.top)
-			savedTop := L.top
-			savedLen := len(L.stack)
-			if base > L.top {
-				if needLen := base + 4; needLen > len(L.stack) {
-					L.reserve(needLen - L.top)
-				}
-				L.top = base
-			}
-			L.push(mm)
-			L.push(t)
-			L.push(k)
-			L.push(v)
-			L.callValue(base, 3, 0)
-			if savedLen > L.top {
-				L.stack = L.stack[:savedLen]
-			}
-			L.top = savedTop
+			callNewIndexMeta(L, mm, t, k, v)
 			return
 		}
 		t = mm
 	}
 	L.runtimeError("'__newindex' chain too long; possible loop")
+}
+
+// callNewIndexMeta invokes the __newindex metamethod mm with (t, k, v)
+// preserving the surrounding Lua frame's L.top and stack length. The
+// metamethod is called above the caller's used registers so its args
+// can't alias live slots, and the caller's stack window is restored on
+// return so the next opcode's register accesses remain in range.
+func callNewIndexMeta(L *stateImpl, mm, t, k, v value) {
+	base := metamethodBase(L, L.top)
+	savedTop := L.top
+	savedLen := len(L.stack)
+	if base > L.top {
+		if needLen := base + 4; needLen > len(L.stack) {
+			L.reserve(needLen - L.top)
+		}
+		L.top = base
+	}
+	L.push(mm)
+	L.push(t)
+	L.push(k)
+	L.push(v)
+	L.callValue(base, 3, 0)
+	if savedLen > len(L.stack) {
+		if savedLen > cap(L.stack) {
+			L.reserve(savedLen - len(L.stack))
+		}
+		L.stack = L.stack[:savedLen]
+	}
+	L.top = savedTop
 }
 
 // findOrCreateUpval returns the open upval at stack index `idx`,

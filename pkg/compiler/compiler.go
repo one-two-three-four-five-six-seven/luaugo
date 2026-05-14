@@ -247,6 +247,12 @@ func (c *compiler) lastInsnIsUnreachableTerminator() bool {
 }
 
 func (c *compiler) compileStat(stat ast.Stat) {
+	// Attribute every instruction emitted while compiling this
+	// statement to its source line. AST positions are 0-based; the
+	// bytecode line-info section is 1-based.
+	if stat != nil {
+		c.cur().pb.setLine(int(stat.Loc().Begin.Line) + 1)
+	}
 	switch s := stat.(type) {
 	case *ast.Block:
 		c.compileBlock(s)

@@ -162,16 +162,85 @@ func baseGCInfo(s *vm.State) int {
 // getfenv / setfenv -- Luau strongly deprecates fenvs.
 // ----------------------------------------------------------------------
 
+// baseGetFEnv implements `getfenv([target])`. Mirrors upstream
+// lbaselib.cpp::luaB_getfenv. The target may be:
+//   - omitted or 0 or 1: return the caller's environment.
+//   - a positive integer level: walk the call stack; level 1 is the
+//     caller of getfenv itself.
+//   - a function: return that function's environment.
+//
+// A missing environment falls back to the thread's globals so the
+// returned value is always a table.
 func baseGetFEnv(s *vm.State) int {
-	// We don't track per-closure environments through the public API;
-	// return the globals proxy as a usable approximation.
-	s.GetGlobal("_G")
+	if s.IsFunction(1) {
+		if envIdx, ok := s.ClosureEnvAt(1); ok {
+			s.PushValue(envIdx)
+			return 1
+		}
+		s.PushThreadGlobals()
+		return 1
+	}
+	// Numeric form. Default level is 1 (the caller of getfenv).
+	level := s.LOptInteger(1, 1)
+	if level < 0 {
+		s.LError("invalid argument #1 to 'getfenv' (level must be non-negative)")
+	}
+	if level == 0 {
+		s.PushThreadGlobals()
+		return 1
+	}
+	// Level 1 should be the caller of getfenv. Our top frame is the
+	// Go function we're currently inside, so level == frame count
+	// from the inside out.
+	if cIdx, ok := s.ClosureAtLevel(int(level) + 1); ok {
+		if envIdx, ok2 := s.ClosureEnvAt(cIdx); ok2 {
+			s.PushValue(envIdx)
+			return 1
+		}
+	}
+	// Fallback: globals.
+	s.PushThreadGlobals()
 	return 1
 }
 
+// baseSetFEnv implements `setfenv(target, env)`. Mirrors upstream
+// lbaselib.cpp::luaB_setfenv. The target may be a function or an
+// integer level. Level 0 reassigns the thread's globals table; any
+// other level walks the call stack and replaces that frame's
+// closure's environment. Returns the function whose environment was
+// changed, or nothing for the level-0 form.
 func baseSetFEnv(s *vm.State) int {
-	s.LError("'setfenv' is not supported")
-	return 0
+	// env must be a table.
+	s.LCheckType(2, vm.TTable)
+
+	if s.IsFunction(1) {
+		if !s.SetClosureEnvAt(1, 2) {
+			s.LError("'setfenv' could not change function environment")
+		}
+		s.PushValue(1)
+		return 1
+	}
+	level := s.LCheckInteger(1)
+	if level < 0 {
+		s.LError("invalid argument #1 to 'setfenv' (level must be non-negative)")
+	}
+	if level == 0 {
+		// Reassign the thread's globals.
+		if !s.SetThreadGlobals(2) {
+			s.LError("'setfenv' could not change thread environment")
+		}
+		return 0
+	}
+	cIdx, ok := s.ClosureAtLevel(int(level) + 1)
+	if !ok {
+		s.LError("invalid argument #1 to 'setfenv' (invalid level)")
+	}
+	if !s.SetClosureEnvAt(cIdx, 2) {
+		s.LError("'setfenv' could not change function environment at level %d", level)
+	}
+	// Return the function whose env we changed (it's at cIdx).
+	s.PushValue(cIdx)
+	return 1
 }
 
 // ----------------------------------------------------------------------
@@ -225,12 +294,16 @@ func baseSetMetatable(s *vm.State) int {
 
 func baseLoadString(s *vm.State) int {
 	src := s.LCheckString(1)
-	chunkname := s.LOptString(2, "=(loadstring)")
+	// Upstream Luau (tests/Conformance.test.cpp `lua_loadstring`) uses
+	// the source itself as the default chunkname when the caller does
+	// not supply one. luaO_chunkid then wraps it as `[string "..."]`,
+	// which conformance fixtures match against.
+	chunkname := s.LOptString(2, src)
 
 	blob, err := compiler.CompileBinary(chunkname, []byte(src), compiler.Defaults())
 	if err != nil {
 		s.PushNil()
-		s.PushString(err.Error())
+		s.PushString(formatLoadStringError(chunkname, src, err))
 		return 2
 	}
 	// CompileBinary embeds parse/compile errors into the blob by
@@ -239,16 +312,102 @@ func baseLoadString(s *vm.State) int {
 	// to expose it as (nil, errmsg) directly.
 	if len(blob) > 0 && blob[0] == 0 {
 		s.PushNil()
-		s.PushString(string(blob[1:]))
+		s.PushString(formatLoadStringError(chunkname, src, &compiler.CompileError{Msg: string(blob[1:])}))
 		return 2
 	}
 	if err := s.Load(chunkname, blob, 0); err != nil {
 		s.PushNil()
-		s.PushString(err.Error())
+		s.PushString(formatLoadStringError(chunkname, src, err))
 		return 2
 	}
 	// Loaded closure is now on top of the stack.
 	return 1
+}
+
+// formatLoadStringError prefixes a compile error with the chunk id and
+// (when available) the source line, matching upstream Luau's
+// `<chunkid>:<line>: <msg>` shape produced by the parser through
+// luaO_chunkid + Lua_pushfstring. Without this prefix, conformance
+// fixtures that match against `^[string ".*"]:` fail to recognise our
+// error strings.
+func formatLoadStringError(chunkname, source string, err error) string {
+	id := luaOChunkID(chunkname, source)
+	line := 0
+	msg := err.Error()
+	if ce, ok := err.(*compiler.CompileError); ok && ce != nil {
+		// ast.Location lines are 0-based; upstream displays 1-based.
+		line = int(ce.Location.Begin.Line) + 1
+		msg = ce.Msg
+	}
+	// If msg already begins with "<id>:" the parser/decoder has
+	// already supplied a properly formatted prefix; emit it as-is.
+	if strings.HasPrefix(msg, id+":") {
+		return msg
+	}
+	if line > 0 {
+		return id + ":" + strconv.Itoa(line) + ": " + msg
+	}
+	return id + ": " + msg
+}
+
+// luaOChunkID is a Go port of upstream Luau's luaO_chunkid
+// (.upstream/VM/src/lobject.cpp). It maps a chunkname (the `source`
+// field on a proto) onto the short display form used in error
+// messages and stack traces:
+//
+//   - leading "=name": use "name" verbatim, truncating to LUA_IDSIZE-1.
+//   - leading "@name": treat as filepath, truncating from the left and
+//     prefixing "..." when too long.
+//   - otherwise:        wrap in [string "..."], truncating the inner
+//     literal at the first newline / when too long.
+func luaOChunkID(source, content string) string {
+	const idsize = 256
+	if len(source) == 0 {
+		return "?"
+	}
+	switch source[0] {
+	case '=':
+		s := source[1:]
+		if len(s) <= idsize-1 {
+			return s
+		}
+		return s[:idsize-1]
+	case '@':
+		s := source[1:]
+		if len(s) <= idsize-1 {
+			return s
+		}
+		// Keep the *tail* of the path; prepend "...".
+		const pre = "..."
+		keep := idsize - 1 - len(pre)
+		if keep < 0 {
+			keep = 0
+		}
+		return pre + s[len(s)-keep:]
+	default:
+		// Use the chunkname text itself if it looks like raw source
+		// (most callers pass the source as chunkname when nothing
+		// better is available). We prefer the actual program text
+		// when provided so that `[string "break label"]:1:` matches
+		// upstream.
+		text := source
+		if content != "" {
+			text = content
+		}
+		// Stop at the first newline -- upstream's strcspn(source, "\n\r").
+		if i := strings.IndexAny(text, "\r\n"); i >= 0 {
+			text = text[:i]
+		}
+		const wrap = `[string "` + `"]`
+		maxInner := idsize - len(wrap) - len("...")
+		if maxInner < 0 {
+			maxInner = 0
+		}
+		if len(text) > maxInner {
+			return `[string "` + text[:maxInner] + `..."]`
+		}
+		return `[string "` + text + `"]`
+	}
 }
 
 // ----------------------------------------------------------------------
