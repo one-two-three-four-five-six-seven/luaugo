@@ -474,57 +474,91 @@ func (g *globalState) sweepStep(budget int) int {
 // when long-running scripts grow the heap.
 func (g *globalState) gcStep(work int) bool {
 	if work <= 0 {
-		// Pause when we're idle and below the trigger.
+		// Throttled tick: skip when explicitly stopped (gc.luau
+		// uses collectgarbage("stop") to inspect allocation
+		// behaviour without the collector interfering) or when
+		// idle and below the next-cycle trigger.
+		if g.gcStopped {
+			return false
+		}
 		if g.gcstate == gcPause && g.totalBytes < g.gcThreshold {
 			return false
 		}
 		work = gcDefaultStepSize
 	}
-	switch g.gcstate {
-	case gcPause:
-		g.markRoots()
-		g.gcstate = gcPropagate
-		return false
-	case gcPropagate:
-		for work > 0 && g.gray != nil {
-			work -= g.propagateMark()
-		}
-		if g.gray == nil {
-			g.gcstate = gcPropagateAgain
-		}
-		return false
-	case gcPropagateAgain:
-		// Re-mark the main thread to capture stack mutations during
-		// propagate.
-		if g.mainthread != nil {
-			g.makeGray(g.mainthread)
-		}
-		for work > 0 && g.gray != nil {
-			work -= g.propagateMark()
-		}
-		g.gcstate = gcAtomic
-		return false
-	case gcAtomic:
-		g.atomic()
-		g.sweepCursor = g.allgc
-		g.gcstate = gcSweep
-		return false
-	case gcSweep:
-		// Each sweep step inspects up to (work / 32) objects.
-		inspected := g.sweepStep(work/32 + 1)
-		_ = inspected
-		if g.sweepCursor == nil {
-			g.gcstate = gcPause
-			// Set new GC threshold: a fraction over current size.
-			g.gcThreshold = g.totalBytes + uint64(int(g.totalBytes)*g.gcStepMul/100)
-			if g.gcThreshold < gcDefaultStepSize {
-				g.gcThreshold = gcDefaultStepSize
+	// One step normally advances the collector through ONE state
+	// transition. Large work budgets (collectgarbage("step", BIG))
+	// loop through states until either the budget is exhausted or
+	// the cycle finishes. This lets gc.luau:100
+	// `dosteps(10000) == 1` succeed: a single 10-MiB-budget step
+	// can drive the cycle from gcPause all the way back to gcPause.
+	allowLoop := work >= 4096
+	for {
+		prev := g.gcstate
+		switch g.gcstate {
+		case gcPause:
+			g.markRoots()
+			g.gcstate = gcPropagate
+		case gcPropagate:
+			for work > 0 && g.gray != nil {
+				w := g.propagateMark()
+				if w == 0 {
+					break
+				}
+				work -= w
 			}
-			return true
+			if g.gray == nil {
+				g.gcstate = gcPropagateAgain
+			}
+		case gcPropagateAgain:
+			// Re-mark the main thread to capture stack mutations
+			// during propagate.
+			if g.mainthread != nil {
+				g.makeGray(g.mainthread)
+			}
+			for work > 0 && g.gray != nil {
+				w := g.propagateMark()
+				if w == 0 {
+					break
+				}
+				work -= w
+			}
+			if g.gray == nil {
+				g.gcstate = gcAtomic
+			}
+		case gcAtomic:
+			g.atomic()
+			g.sweepCursor = g.allgc
+			g.gcstate = gcSweep
+		case gcSweep:
+			// Each sweep step inspects up to (work / 32) objects.
+			steps := work/32 + 1
+			n := g.sweepStep(steps)
+			work -= n * 32
+			if g.sweepCursor == nil {
+				g.gcstate = gcPause
+				// Set new GC threshold: a fraction over current size.
+				g.gcThreshold = g.totalBytes + uint64(int(g.totalBytes)*g.gcStepMul/100)
+				if g.gcThreshold < gcDefaultStepSize {
+					g.gcThreshold = gcDefaultStepSize
+				}
+				return true
+			}
+		default:
+			return false
 		}
-		return false
+		if !allowLoop {
+			return false
+		}
+		if work <= 0 {
+			return false
+		}
+		if prev == g.gcstate {
+			// No transition made and budget unchanged -- nothing
+			// to advance this step.
+			return false
+		}
 	}
-	return false
 }
 
 // fullGC runs a complete cycle synchronously.

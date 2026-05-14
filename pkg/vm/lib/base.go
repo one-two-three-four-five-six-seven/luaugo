@@ -128,16 +128,33 @@ func baseCollectGarbage(s *vm.State) int {
 		s.CollectGarbage()
 		s.PushInteger(0)
 	case "step":
-		// Our GC is not properly incremental for gc.luau's fine-
-		// grained iteration-counting idiom; run a full collection
-		// and report "cycle finished" so the repeat-until pattern
-		// terminates. gc.luau:98 fails as a result, but every
-		// other fixture that uses collectgarbage("step") just
-		// wants forward progress, which this provides.
-		s.CollectGarbage()
-		s.PushBoolean(true)
-	case "stop", "restart", "isrunning",
-		"setpause", "setstepmul":
+		// Drive the incremental collector by `siz` KiB of work.
+		// Tiny siz still progresses (the collector returns true
+		// only when the cycle reaches gcPause), so the
+		// "repeat ... until collectgarbage('step', siz)" idiom in
+		// gc.luau:91-93 loops a meaningful number of times. Large
+		// siz finishes a whole cycle in one call. Note this is
+		// the per-fixture "manually drive the GC" path; the
+		// allocation-triggered auto-step is a separate piece of
+		// infra we don't have, so weak-table fixtures like
+		// closure.luau:30 still rely on explicit
+		// `collectgarbage()` to fire collection.
+		siz := s.LOptInteger(2, 0)
+		work := int(siz) * 1024
+		if work <= 0 {
+			work = 64
+		}
+		finished := s.GCStep(work)
+		s.PushBoolean(finished)
+	case "stop":
+		s.SetGCStopped(true)
+		s.PushInteger(0)
+	case "restart":
+		s.SetGCStopped(false)
+		s.PushInteger(0)
+	case "isrunning":
+		s.PushBoolean(!s.GCStopped())
+	case "setpause", "setstepmul":
 		s.PushInteger(0)
 	default:
 		s.LError("invalid option '%s' to 'collectgarbage'", opt)
