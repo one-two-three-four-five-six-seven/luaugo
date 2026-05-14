@@ -465,8 +465,19 @@ func (g *globalState) sweepStep(budget int) int {
 
 // step advances the GC by approximately `work` units. Returns true if
 // the current cycle finished.
+//
+// When work is 0 the call is treated as a "throttled tick": we only
+// advance the collector if memory pressure (totalBytes) has crossed
+// the configured threshold. This keeps tight per-iteration call sites
+// (NEWCLOSURE, FORNLOOP, ...) cheap when the program isn't actually
+// allocating GC objects, while still driving the collector forward
+// when long-running scripts grow the heap.
 func (g *globalState) gcStep(work int) bool {
 	if work <= 0 {
+		// Pause when we're idle and below the trigger.
+		if g.gcstate == gcPause && g.totalBytes < g.gcThreshold {
+			return false
+		}
 		work = gcDefaultStepSize
 	}
 	switch g.gcstate {

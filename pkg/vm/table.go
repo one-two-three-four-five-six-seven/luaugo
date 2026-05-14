@@ -554,6 +554,35 @@ func (t *table) rehash(g *globalState, ek value) {
 	}
 	na := computeSizes(nums, &nasize)
 	nh := totaluse - na
+
+	// Mirror upstream adjustasize (VM/src/ltable.cpp:454): grow the
+	// array part to absorb the inserted key when it sits exactly one
+	// past the current size, and any contiguous run of integer-keyed
+	// entries in the hash part. Then re-apply the 50%-occupation
+	// memory bonus (extra array slots cost half what hash buckets
+	// do, so we reclaim the savings).
+	nadjusted := adjustasize(t, nasize, ek)
+	aextra := nadjusted - nasize
+	if aextra > 0 {
+		nh -= aextra
+		nasize = nadjusted + aextra
+		nasize = adjustasize(t, nasize, ek)
+	}
+
+	// Additional growth policy: when the array is being grown via
+	// a boundary rehash (insertion of t[len+1]), double the proposed
+	// nasize. Without this, sequential `for i=1, N do t[i] = i end`
+	// produces O(N^2) total rehash work; with doubling, total work
+	// is amortised O(N). Upstream Luau enjoys the same amortised
+	// behaviour because its allocator's realloc can extend in place
+	// O(1) for many growth steps; we can't piggyback on that, so
+	// pay the doubling cost explicitly.
+	if nasize > len(t.array) && len(t.array) > 0 {
+		if doubled := 2 * len(t.array); nasize < doubled {
+			nasize = doubled
+		}
+	}
+
 	// Guarantee forward progress: every rehash must add capacity for
 	// at least one more entry. Without this, set() can spin in a
 	// rehash loop when the sizing heuristic stays at the same shape
@@ -562,7 +591,39 @@ func (t *table) rehash(g *globalState, ek value) {
 	if nh <= len(t.nodes) && nasize <= len(t.array) {
 		nh = len(t.nodes) + 1
 	}
+	if nh < 0 {
+		nh = 0
+	}
 	t.resize(g, nasize, nh)
+}
+
+// adjustasize bumps the proposed array size up until the boundary
+// invariant holds: the entry one past the new size must be nil (in
+// both array and hash views). When `ek` is a numeric key, we also
+// guarantee it falls inside the array if it is the next sequential
+// slot. Mirrors upstream's static adjustasize in ltable.cpp.
+func adjustasize(t *table, size int, ek value) int {
+	var ekIndex int = -1
+	if ek.tag == TNumber {
+		if i, ok := tryArrayIndex(ek.num); ok {
+			ekIndex = i
+		}
+	}
+	tbound := len(t.nodes) > 0
+	for {
+		if size+1 == ekIndex {
+			size++
+			continue
+		}
+		if tbound {
+			if v := t.getNum(size + 1); v.tag != TNil {
+				size++
+				continue
+			}
+		}
+		break
+	}
+	return size
 }
 
 func (t *table) numUseArray(nums []int) int {
