@@ -382,6 +382,16 @@ func (s *State) NewUserdataDtor(obj any, dtor func()) {
 	s.impl.push(userdataValue(u))
 }
 
+// PushUserdataObject pushes a tagged Go-backed userdata onto the
+// stack. The object can be retrieved later via ToUserdata(idx). This
+// is the no-finalizer counterpart to NewUserdataDtor and is used by
+// conformance shims (notably int64, vec2) that want a true Userdata
+// type identity with arbitrary Go state attached.
+func (s *State) PushUserdataObject(obj any, tag byte) {
+	u := newUserdataObject(s.impl.gs, obj, tag)
+	s.impl.push(userdataValue(u))
+}
+
 // ToUserdata returns the user data Go object for the value at idx, or
 // nil if it isn't a userdata.
 func (s *State) ToUserdata(idx int) any {
