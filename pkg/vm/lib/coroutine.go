@@ -162,8 +162,17 @@ func coWrap(s *vm.State) int {
 		nargs := s.Top()
 		nres, ok := auxResume(s, co, nargs)
 		if !ok {
-			// Error value is on top of s; raise it as a Lua error.
-			s.Error()
+			// Error value is on top of s; raise it as a Lua error
+			// with the caller's source location prefix prepended
+			// (matching upstream luaL_error semantics in cowrap).
+			// If the error is a string, prepend "chunkname:line: ";
+			// otherwise re-raise the value verbatim.
+			if errStr, isStr := s.ToString(-1); isStr {
+				s.Pop(1)
+				s.LError("%s", errStr)
+			} else {
+				s.Error()
+			}
 		}
 		return nres
 	}
