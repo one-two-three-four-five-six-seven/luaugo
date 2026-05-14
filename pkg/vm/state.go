@@ -83,6 +83,18 @@ type globalState struct {
 	gcStepMul   int
 	gcStepSize  int
 
+	// gcStopped is set by collectgarbage("stop") and cleared by
+	// collectgarbage("restart"). When true, the auto-step driven
+	// by allocBytes is suppressed so scripts that explicitly want
+	// to control collection (gc.luau:80 / 108) can observe their
+	// own allocation pressure.
+	gcStopped bool
+
+	// gcInStep is the re-entrancy guard set while gcStep is
+	// executing; allocations done during marking/sweeping bump
+	// totalBytes but must not recursively call gcStep.
+	gcInStep bool
+
 	// resumeDepth counts the number of currently in-flight nested
 	// coroutine resumes on this global state. Upstream uses
 	// L->nCcalls combined with LUAI_MAXCCALLS for the same gate;

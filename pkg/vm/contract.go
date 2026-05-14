@@ -382,6 +382,15 @@ func (s *State) CollectGarbage() { s.collectGarbage() }
 // during this step. Mirrors upstream lua_gc(LUA_GCSTEP).
 func (s *State) GCStep(work int) bool { return s.impl.gs.gcStep(work) }
 
+// SetGCStopped suspends or resumes the automatic GC stepping driven
+// by allocations. Mirrors lua_gc(LUA_GCSTOP) / LUA_GCRESTART.
+// CollectGarbage and explicit GCStep calls bypass this flag.
+func (s *State) SetGCStopped(stopped bool) { s.impl.gs.gcStopped = stopped }
+
+// GCStopped reports whether the GC is currently suspended. Mirrors
+// lua_gc(LUA_GCISRUNNING) (inverted).
+func (s *State) GCStopped() bool { return s.impl.gs.gcStopped }
+
 // ----------------------------------------------------------------------
 // Library opening
 // ----------------------------------------------------------------------

@@ -128,11 +128,12 @@ func baseCollectGarbage(s *vm.State) int {
 		s.CollectGarbage()
 		s.PushInteger(0)
 	case "step":
-		// Upstream returns a boolean: true if the step completed
-		// the collection cycle. Our implementation does a full
-		// collection on every step (we don't model incremental
-		// passes); report "cycle finished" as true so
-		// `until collectgarbage("step", siz)` (gc.luau) terminates.
+		// Our GC is not properly incremental for gc.luau's fine-
+		// grained iteration-counting idiom; run a full collection
+		// and report "cycle finished" so the repeat-until pattern
+		// terminates. gc.luau:98 fails as a result, but every
+		// other fixture that uses collectgarbage("step") just
+		// wants forward progress, which this provides.
 		s.CollectGarbage()
 		s.PushBoolean(true)
 	case "stop", "restart", "isrunning",
