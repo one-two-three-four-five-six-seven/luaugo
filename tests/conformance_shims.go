@@ -98,18 +98,26 @@ func installConformanceShims(s *vm.State) {
 		return 0
 	})
 	s.Register("resumeerror", func(state *vm.State) int {
-		// Best-effort: push the message and raise. Real upstream
-		// resumes the target coroutine with an error pending; we
-		// cannot reach into another State here without re-exporting
-		// internals, so we just error out. pcall.luau will not pass
-		// either way -- this keeps the surrounding fixture from
-		// nil-calling and aids diagnosis.
-		if state.Top() >= 2 {
-			state.PushValue(2)
-		} else {
-			state.PushString("resumeerror")
+		// resumeerror(co, errvalue): resume co with errvalue raised
+		// as a Lua error at the yield (or initial call) point.
+		// Mirrors upstream lua_resumeerror used by
+		// conformance/pcall.luau:144.
+		if state.Top() < 1 || state.Type(1) != vm.TThread {
+			state.LError("invalid argument #1 to 'resumeerror' (coroutine expected)")
 		}
-		state.Error()
+		co := state.ToThread(1)
+		if co == nil {
+			state.LError("invalid argument #1 to 'resumeerror' (coroutine expected)")
+		}
+		// Use the error value as a string when possible, otherwise
+		// fall back to "resumeerror" sentinel. The fixture passes a
+		// string ("fail") so the string branch suffices.
+		if state.Top() >= 2 && state.Type(2) == vm.TString {
+			msg, _ := state.ToString(2)
+			co.ResumeError(state, msg)
+		} else {
+			co.ResumeError(state, "resumeerror")
+		}
 		return 0
 	})
 

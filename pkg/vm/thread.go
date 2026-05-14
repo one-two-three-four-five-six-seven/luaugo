@@ -23,15 +23,28 @@ import (
 
 // coroutine carries the per-coroutine extension data.
 type coroutine struct {
-	// resumeCh: main side sends a slice of args to start/continue the
-	// coroutine; coroutine side receives.
-	resumeCh chan []value
+	// resumeCh: main side sends a resumeMsg to start/continue the
+	// coroutine; coroutine side receives. The message carries either
+	// argument values for a normal resume or a pending error value
+	// for resumeerror (upstream lua_resumeerror semantics).
+	resumeCh chan resumeMsg
 	// yieldCh: coroutine side sends a yieldMsg; main side receives.
 	yieldCh chan yieldMsg
 	// started indicates the goroutine has been spawned.
 	started bool
 	// finished indicates the goroutine has terminated.
 	finished bool
+}
+
+// resumeMsg is sent by the main side to the coroutine. When errPending
+// is true, the coroutine must wake up by raising errValue as if
+// upstream's lua_resumeerror had been called: the error propagates
+// from the yield point through the coroutine body. When errPending is
+// false, values carries the normal resume arguments.
+type resumeMsg struct {
+	values     []value
+	errValue   value
+	errPending bool
 }
 
 // yieldMsg is sent by the coroutine when it yields or returns or errors.
@@ -74,7 +87,7 @@ func (s *State) newThreadImpl() *State {
 	}
 	parent.gs.gcInit(th, TThread, memSizeThreadHdr)
 	th.co = &coroutine{
-		resumeCh: make(chan []value, 1),
+		resumeCh: make(chan resumeMsg, 1),
 		yieldCh:  make(chan yieldMsg, 1),
 	}
 	w := &State{impl: th}
@@ -119,7 +132,7 @@ func (co *State) resumeImpl(from *State, nargs int) Status {
 		// caller after NewThread).
 		go func() {
 			// The goroutine acquires the VM mutex before running.
-			args := <-c.resumeCh
+			msg := <-c.resumeCh
 			mu.Lock()
 			func() {
 				defer mu.Unlock()
@@ -155,18 +168,23 @@ func (co *State) resumeImpl(from *State, nargs int) Status {
 				if si.top < 1 {
 					panic(luaRTError{msg: "coroutine has no function to run", value: stringValue(si.gs.intern("coroutine has no function to run"))})
 				}
+				// If this initial resume carries a pending error,
+				// propagate it before the body even gets to run.
+				if msg.errPending {
+					panic(luaRTError{value: msg.errValue})
+				}
 				// args were already pushed above the function. Push them now.
-				for _, a := range args {
+				for _, a := range msg.values {
 					si.push(a)
 				}
-				si.callFromGo(len(args), MultRet)
+				si.callFromGo(len(msg.values), MultRet)
 			}()
 		}()
 		// Now hand off control: send args, then wait for yield/finish.
-		c.resumeCh <- args
+		c.resumeCh <- resumeMsg{values: args}
 	} else {
 		// Re-entry: hand args to the awaiting goroutine.
-		c.resumeCh <- args
+		c.resumeCh <- resumeMsg{values: args}
 	}
 
 	// Wait for the coroutine to yield, return, or error.
@@ -241,11 +259,102 @@ func (s *State) yieldImpl(nresults int) int {
 	// Yield: send values, drop the VM mutex, wait for next resume.
 	c.yieldCh <- yieldMsg{status: StatusYield, values: vals}
 	mu.Unlock()
-	args := <-c.resumeCh
+	msg := <-c.resumeCh
 	mu.Lock()
+	// If the resumer signalled a pending error (resumeerror), wake up
+	// by raising it. The error propagates from this yield point
+	// through the coroutine body as if `error(value)` had been called
+	// in place of yield's return -- matching upstream lua_resumeerror.
+	if msg.errPending {
+		panic(luaRTError{value: msg.errValue})
+	}
 	// Push args onto the coroutine's stack as return values from yield.
-	for _, a := range args {
+	for _, a := range msg.values {
 		si.push(a)
 	}
-	return len(args)
+	return len(msg.values)
+}
+
+// ResumeError resumes the coroutine, waking it up with `errValue`
+// raised as a Lua error at the yield (or initial call) point. Mirrors
+// upstream lua_resumeerror; conformance/pcall.luau:144 exercises this
+// with `resumeerror(co, "fail")`.
+//
+// Returns the resulting status (StatusErrRun if the error propagates
+// uncaught out of the coroutine, StatusOK or StatusYield otherwise).
+// Like Resume, `from` may be nil for main-thread callers.
+func (co *State) ResumeError(from *State, errValue any) Status {
+	c := co.impl.co
+	if c == nil || c.finished {
+		co.impl.status = StatusErrRun
+		return StatusErrRun
+	}
+	// Convert the Go-side error value to a vm.value. We accept any
+	// stack-style index (int), a string, or treat everything else as
+	// a generic "resume error" sentinel; callers that need richer
+	// values should push them via the stack and call this from a
+	// site that can read them.
+	var ev value
+	switch v := errValue.(type) {
+	case string:
+		ev = stringValue(co.impl.gs.intern(v))
+	case value:
+		ev = v
+	default:
+		ev = stringValue(co.impl.gs.intern("resume error"))
+	}
+
+	mu := getVMMutex(co.impl.gs)
+	if !c.started {
+		// The coroutine hasn't started yet; spawn its goroutine just
+		// to deliver the pending error and have it propagate out.
+		c.started = true
+		go func() {
+			msg := <-c.resumeCh
+			mu.Lock()
+			defer mu.Unlock()
+			defer func() {
+				if r := recover(); r != nil {
+					var errVal value
+					if e, ok := r.(luaRTError); ok {
+						errVal = e.value
+					} else {
+						errVal = stringValue(co.impl.gs.intern("coroutine error"))
+					}
+					c.finished = true
+					c.yieldCh <- yieldMsg{status: StatusErrRun, err: errVal}
+					return
+				}
+				c.finished = true
+				c.yieldCh <- yieldMsg{status: StatusOK}
+			}()
+			if msg.errPending {
+				panic(luaRTError{value: msg.errValue})
+			}
+		}()
+	}
+	c.resumeCh <- resumeMsg{errPending: true, errValue: ev}
+
+	// Wait for the coroutine to yield, return, or error -- same mutex
+	// dance as resumeImpl.
+	heldByFrom := from != nil && from.impl.co != nil && from.impl.co.started
+	if heldByFrom {
+		mu.Unlock()
+	}
+	msg := <-c.yieldCh
+	if heldByFrom {
+		mu.Lock()
+	}
+	if msg.status == StatusErrRun {
+		// Push the error value onto co's stack so the caller can
+		// retrieve it via co.ToString(-1) etc.
+		co.impl.push(msg.err)
+		co.impl.status = StatusErrRun
+		return StatusErrRun
+	}
+	co.impl.status = msg.status
+	for _, v := range msg.values {
+		co.impl.push(v)
+	}
+	return msg.status
 }
