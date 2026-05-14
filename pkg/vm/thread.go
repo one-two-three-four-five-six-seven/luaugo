@@ -246,6 +246,12 @@ func (s *State) yieldImpl(nresults int) int {
 	if c == nil {
 		si.runtimeError("attempt to yield from outside a coroutine")
 	}
+	if si.nonyieldable > 0 {
+		// Inside a non-yieldable Go call (table.sort comparator etc.).
+		// Upstream raises this same wording in luaB_yield's gate
+		// (lcorolib.cpp + ldo.cpp's luaD_yield).
+		si.runtimeError("attempt to yield across metamethod/C-call boundary")
+	}
 	// Collect values from the top of the stack.
 	if nresults > si.top {
 		nresults = si.top

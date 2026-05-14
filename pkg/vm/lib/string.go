@@ -872,6 +872,12 @@ func strGsub(s *vm.State) int {
 	if repType != vm.TString && repType != vm.TNumber && repType != vm.TFunction && repType != vm.TTable {
 		s.LArgError(3, "string/function/table expected")
 	}
+	// gsub callbacks run in non-yieldable context (upstream's
+	// lcorolib gates them through nCcalls). conformance/coroutine.luau
+	// :135 verifies coroutine.isyieldable() == false inside an f
+	// supplied to string.gsub.
+	s.EnterNonYieldable()
+	defer s.LeaveNonYieldable()
 
 	anchor := len(pattern) > 0 && pattern[0] == '^'
 	patStart := 0

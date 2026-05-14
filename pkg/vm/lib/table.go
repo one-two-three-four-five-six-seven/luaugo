@@ -520,6 +520,12 @@ func tableSort(s *vm.State) int {
 	if s.GetReadonly(1) {
 		s.LError("attempt to modify a readonly table")
 	}
+	// table.sort is non-yieldable upstream: the comparator is invoked
+	// in a "C call" context that gates luaD_yield. conformance/
+	// coroutine.luau:123 wraps `not pcall(table.sort, {1,2,3},
+	// coroutine.yield)` to verify the yield is refused.
+	s.EnterNonYieldable()
+	defer s.LeaveNonYieldable()
 	n := tableLibLen(s, 1)
 	hasComp := !s.IsNoneOrNil(2)
 	if hasComp {

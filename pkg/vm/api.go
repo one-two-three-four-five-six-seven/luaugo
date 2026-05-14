@@ -354,6 +354,25 @@ func (s *State) NewUserdataTagged(size int, tag byte) []byte {
 	return u.data
 }
 
+// EnterNonYieldable marks the current Go call as non-yieldable. While
+// the depth is positive, coroutine.yield raises an error instead of
+// suspending. Use in pairs with LeaveNonYieldable around any stdlib
+// entry point that internally calls back into Lua code which must not
+// yield (table.sort comparator, table.foreach iterator, etc.).
+//
+// Mirrors upstream's L->nCcalls bookkeeping that gates luaD_yield.
+func (s *State) EnterNonYieldable() { s.impl.nonyieldable++ }
+
+// LeaveNonYieldable balances a prior EnterNonYieldable. Always pair
+// these with `defer s.LeaveNonYieldable()` immediately after the
+// EnterNonYieldable call so an early panic does not leave the counter
+// elevated for the rest of the thread's lifetime.
+func (s *State) LeaveNonYieldable() {
+	if s.impl.nonyieldable > 0 {
+		s.impl.nonyieldable--
+	}
+}
+
 // UserdataTag returns the host-defined tag byte on the userdata at
 // idx, or 0 if idx does not hold a userdata. Mirrors upstream
 // lua_userdatatag.
@@ -479,7 +498,10 @@ func (s *State) PushThread() bool {
 // coroutine.yield on the main thread still errors (yieldImpl checks
 // for a real coroutine).
 func (s *State) IsYieldable() bool {
-	return true
+	// Inside a non-yieldable Go call (e.g. table.sort comparator,
+	// string.gsub callback), upstream's gate returns false. We track
+	// the same condition via stateImpl.nonyieldable.
+	return s.impl.nonyieldable == 0
 }
 
 // CoStatus returns the status of co viewed from s, using upstream's

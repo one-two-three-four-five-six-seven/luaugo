@@ -35,6 +35,14 @@ type stateImpl struct {
 	wrapper   *State      // cached *State view of this thread
 	co        *coroutine  // coroutine bookkeeping (nil for main thread)
 	status    Status      // last status for this thread
+
+	// nonyieldable counts the depth of currently-running non-yieldable
+	// Go calls (table.sort's comparator dispatch, debug.* introspection
+	// helpers, etc.). When >0, coroutine.yield raises
+	// "attempt to yield across metamethod/C-call boundary" instead of
+	// suspending. Mirrors upstream's `L->nCcalls > L->baseCcalls`
+	// gate, scoped per-thread.
+	nonyieldable int
 }
 
 // globalState is the shared "global_State" referenced by every thread
