@@ -121,7 +121,21 @@ func baseCollectGarbage(s *vm.State) int {
 	switch opt {
 	case "count":
 		s.PushNumber(float64(s.GCInfo()))
-	case "collect", "stop", "restart", "step", "isrunning",
+	case "collect":
+		// Run a full GC cycle. Conformance fixtures like
+		// coroutine.luau:204 rely on a synchronous collection
+		// happening here to clear weak references.
+		s.CollectGarbage()
+		s.PushInteger(0)
+	case "step":
+		// Upstream returns a boolean: true if the step completed
+		// the collection cycle. Our implementation does a full
+		// collection on every step (we don't model incremental
+		// passes); report "cycle finished" as true so
+		// `until collectgarbage("step", siz)` (gc.luau) terminates.
+		s.CollectGarbage()
+		s.PushBoolean(true)
+	case "stop", "restart", "isrunning",
 		"setpause", "setstepmul":
 		s.PushInteger(0)
 	default:

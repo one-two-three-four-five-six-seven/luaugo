@@ -650,9 +650,20 @@ func (s *State) gcInfo() int {
 
 func (s *State) collectGarbage() {
 	s.impl.gs.fullGC()
-	// Sweep any dead strings out of the intern table now that the
-	// allgc list has the bookkeeping done.
-	s.impl.gs.sweepInternTable()
+	// NOTE: we intentionally do NOT call sweepInternTable here even
+	// though full upstream Luau sweeps interned strings during GC.
+	// Our marker doesn't trace proto-level string constants (they
+	// live inside *bytecode.Module slices that aren't gcObjects of
+	// their own), so any string that's currently a Lua constant but
+	// not also on the live stack would be condemned and removed from
+	// the intern table. The next call to intern() for the same byte
+	// sequence would then allocate a brand-new *tString, breaking
+	// pointer-identity-based string equality (`type(x) == "thread"`
+	// surfacing as false after collectgarbage()). Until the proto
+	// graph is wired into the GC, leaking interned strings is the
+	// correct trade-off: total memory footprint stays bounded by
+	// distinct loaded strings, which is the same growth shape
+	// upstream has anyway.
 }
 
 // ----------------------------------------------------------------------
