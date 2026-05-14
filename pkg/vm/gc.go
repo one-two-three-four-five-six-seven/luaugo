@@ -394,6 +394,23 @@ func (g *globalState) atomic() {
 }
 
 func (g *globalState) clearWeak() {
+	// isCleared reports whether v references a still-white (i.e.
+	// unreachable) GC object. Strings are special-cased: upstream's
+	// isobjcleared marks the string and returns "not cleared" so
+	// strings in weak tables never get swept. Mirror that here so
+	// gc.luau:152 ("for k,v in pairs(a) do assert(k==v or k..'#'==v)")
+	// observes string keys/values surviving.
+	isCleared := func(v value) bool {
+		if !v.isCollectable() || v.gc == nil {
+			return false
+		}
+		if v.tag == TString {
+			// Mark the string and treat it as live.
+			g.makeGray(v.gc)
+			return false
+		}
+		return isWhite(v.gc)
+	}
 	for o := g.weak; o != nil; {
 		next := o.gcHead().graylink
 		o.gcHead().graylink = nil
@@ -408,7 +425,7 @@ func (g *globalState) clearWeak() {
 
 		for i := range t.array {
 			v := t.array[i]
-			if weakV && v.isCollectable() && v.gc != nil && isWhite(v.gc) {
+			if weakV && isCleared(v) {
 				t.array[i] = nilValue()
 			}
 		}
@@ -418,10 +435,10 @@ func (g *globalState) clearWeak() {
 				continue
 			}
 			drop := false
-			if weakK && n.key.isCollectable() && n.key.gc != nil && isWhite(n.key.gc) {
+			if weakK && isCleared(n.key) {
 				drop = true
 			}
-			if weakV && n.val.isCollectable() && n.val.gc != nil && isWhite(n.val.gc) {
+			if weakV && isCleared(n.val) {
 				drop = true
 			}
 			if drop {
