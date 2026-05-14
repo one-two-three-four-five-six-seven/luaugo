@@ -120,8 +120,14 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				if kv.tag != TString {
 					L.runtimeError("GETGLOBAL key is not a string")
 				}
-				v, _ := cl.env.getStr(kv.gc.(*tString))
-				L.stack[base+int(a)] = v
+				// Mirror upstream lvmexecute.cpp LOP_GETGLOBAL:
+				// the lookup goes through luaV_gettable which honours
+				// __index on the env table. A raw getStr here breaks
+				// the setfenv(... {__index=_G}) idiom that
+				// conformance/events.luau:475-477 exercises.
+				ci.savedpc = pc
+				ci.top = L.top
+				L.stack[base+int(a)] = indexValue(L, tableValue(cl.env), kv)
 
 			case common.OpSetGlobal:
 				aux := code[pc]
@@ -130,7 +136,11 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				if kv.tag != TString {
 					L.runtimeError("SETGLOBAL key is not a string")
 				}
-				cl.env.setStr(L.gs, kv.gc.(*tString), L.stack[base+int(a)])
+				// Mirror upstream LOP_SETGLOBAL: writes go through
+				// luaV_settable so __newindex on the env table fires.
+				ci.savedpc = pc
+				ci.top = L.top
+				newIndexValue(L, tableValue(cl.env), kv, L.stack[base+int(a)])
 
 			case common.OpGetUpval:
 				b := common.InsnB(insn)
@@ -156,8 +166,20 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				_ = code[pc] // AUX is packed import id (also stored as light-userdata in K(D))
 				aux := code[pc]
 				pc++
-				// We use AUX (packed) as authoritative.
-				L.stack[base+int(a)] = getImport(L, cl.env, aux, constants)
+				// Mirror upstream LOP_GETIMPORT: when the env is the
+				// safeenv (untouched globals table) we can resolve
+				// via the precomputed import path; otherwise we MUST
+				// fall back to per-step lookup through luaV_gettable
+				// so __index on the (replaced) env table is honoured.
+				// conformance/events.luau:475-477 sets up exactly
+				// such an env via setfenv(1, setmetatable({}, ...)).
+				ci.savedpc = pc
+				ci.top = L.top
+				if cl.env.safeenv {
+					L.stack[base+int(a)] = getImport(L, cl.env, aux, constants)
+				} else {
+					L.stack[base+int(a)] = getImportFallback(L, cl.env, aux, constants)
+				}
 				_ = d
 
 			case common.OpGetTable:
@@ -1341,6 +1363,51 @@ func opToTM(op common.Opcode) TM {
 
 // getImport resolves an import packed id into a value by walking env
 // using the constants table for string indices.
+// getImportFallback walks the packed import chain using indexValue
+// at every step, so __index on the env (or on intermediate tables) is
+// honoured. Mirrors upstream LOP_GETIMPORT's non-safeenv path.
+//
+// Unlike getImport (the safeenv fast path) we do NOT bail out early
+// when an intermediate value is non-table: indexValue will produce
+// the right error message ("attempt to index a <tag> value") if a
+// script does `foo.bar.baz` with foo being a number, etc.
+func getImportFallback(L *stateImpl, env *table, packed uint32, constants []value) value {
+	count := packed >> 30
+	id0 := int(packed>>20) & 1023
+	id1 := int(packed>>10) & 1023
+	id2 := int(packed) & 1023
+	if int(id0) >= len(constants) {
+		return nilValue()
+	}
+	k0 := constants[id0]
+	if k0.tag != TString {
+		return nilValue()
+	}
+	v := indexValue(L, tableValue(env), k0)
+	if count < 2 || v.tag == TNil {
+		return v
+	}
+	if int(id1) >= len(constants) {
+		return v
+	}
+	k1 := constants[id1]
+	if k1.tag != TString {
+		return v
+	}
+	v = indexValue(L, v, k1)
+	if count < 3 || v.tag == TNil {
+		return v
+	}
+	if int(id2) >= len(constants) {
+		return v
+	}
+	k2 := constants[id2]
+	if k2.tag != TString {
+		return v
+	}
+	return indexValue(L, v, k2)
+}
+
 func getImport(L *stateImpl, env *table, packed uint32, constants []value) value {
 	count := packed >> 30
 	id0 := int(packed>>20) & 1023
