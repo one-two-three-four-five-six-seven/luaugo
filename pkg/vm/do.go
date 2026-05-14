@@ -483,6 +483,16 @@ func (s *stateImpl) pcallFromGo(nargs, nresults, errfunc int) (st Status) {
 				// Run errfunc(errVal) but protect from further error.
 				efFrames := len(s.frames)
 				efTop := s.top
+				// xpcall's error handler runs in a non-yieldable C
+				// context upstream (luaD_call() advances baseCcalls
+				// before invoking the handler). Mirror that so any
+				// coroutine.yield from inside the handler errors
+				// instead of suspending the surrounding coroutine.
+				// conformance/coroutine.luau:391 relies on this for
+				// `co(0, coroutine.yield, 0)` to die rather than
+				// yield through the wrapped xpcall.
+				s.nonyieldable++
+				defer func() { s.nonyieldable-- }()
 				func() {
 					defer func() {
 						if rr := recover(); rr != nil {
