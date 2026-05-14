@@ -1273,7 +1273,7 @@ func packOption(s *vm.State, h *packHeader, fmtStr string, i int) (packKind, int
 	case '!':
 		ma, ni := packReadDigits(fmtStr, i, 8)
 		if ma <= 0 || ma > 16 {
-			s.LError("alignment %d out of range", ma)
+			s.LError("integral size (%d) out of limits [1,16]", ma)
 		}
 		h.maxAlign = ma
 		return kNop, 0, ni

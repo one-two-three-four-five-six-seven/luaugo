@@ -126,6 +126,21 @@ type loopCtx struct {
 	// requireClose tracks whether any local declared inside the loop
 	// has been captured; if so break/continue must emit CLOSEUPVALS.
 	requireClose bool
+
+	// closeReg is the lowest register that holds a loop-scope local
+	// (i.e. a local declared at loop entry such as the for-loop
+	// variable, or the first body local for while). break/continue
+	// emit a CLOSEUPVALS at this register before jumping so any
+	// closures that captured a loop-scope local get a fresh upvalue
+	// for the next iteration -- or are properly closed when we leave
+	// the loop.
+	closeReg uint8
+	// breakClose / continueClose select whether break/continue emit
+	// a CLOSEUPVALS at closeReg. For repeat...until, continue must
+	// NOT close body locals because the until expression can still
+	// reference them in scope.
+	breakClose    bool
+	continueClose bool
 }
 
 func (c *compiler) cur() *funcCtx { return c.funcStack[len(c.funcStack)-1] }
@@ -401,21 +416,48 @@ func (c *compiler) compileLocalDecl(s *ast.StatLocal) {
 }
 
 // compileAssign handles `a, b, c = e1, e2, e3`.
+//
+// Per Luau/Lua semantics, every LHS target's table and key
+// sub-expressions must be evaluated BEFORE any of the LHS slots are
+// written. Otherwise, writing to a local that is also used in a later
+// LHS index expression (e.g. `a, b[a] = 43, -1`) would corrupt the
+// index. We therefore pre-resolve every target into an lvalueDesc
+// snapshot (allocating temps for `obj` and `key` of indexed targets)
+// before compiling the RHS, then perform the assignments in order.
 func (c *compiler) compileAssign(s *ast.StatAssign) {
 	fc := c.cur()
 	nvars := len(s.Vars)
 	nvals := len(s.Values)
 
-	// Step 1: compile all RHS values into a contiguous block of
-	// temporaries (in declaration order).
+	// Single assignment fast path keeps the simpler/older codegen.
+	if nvars == 1 && nvals == 1 {
+		base := fc.pb.top
+		tmp := fc.pb.reserveReg(1)
+		c.compileExprToReg(s.Values[0], tmp)
+		c.compileAssignTarget(s.Vars[0], tmp)
+		fc.pb.setTop(base)
+		return
+	}
+
+	// Step 1: pre-evaluate all LHS target addresses (table + key for
+	// indexed targets). These temps live BELOW the RHS temps so they
+	// are not perturbed by RHS compilation.
 	base := fc.pb.top
+	descs := make([]lvalueDesc, nvars)
+	for i, target := range s.Vars {
+		descs[i] = c.preEvalLValue(target)
+	}
+
+	// Step 2: compile all RHS values into a contiguous block of
+	// temporaries (in declaration order), above the LHS temps.
+	rhsBase := fc.pb.top
 	for i, e := range s.Values {
 		isLast := i == nvals-1
 		if isLast && nvars > nvals && c.isMultRetExpr(e) {
 			needed := nvars - i
 			reg := fc.pb.reserveReg(needed)
 			_ = reg
-			c.compileExprMultRetExact(e, base+uint8(i), needed)
+			c.compileExprMultRetExact(e, rhsBase+uint8(i), needed)
 			break
 		}
 		reg := fc.pb.reserveReg(1)
@@ -433,15 +475,109 @@ func (c *compiler) compileAssign(s *ast.StatAssign) {
 		fc.pb.setTop(fc.pb.top - uint8(nvals-nvars))
 	}
 
-	// Step 2: assign each temp to the target.
-	for i, target := range s.Vars {
-		if i >= nvars {
-			break
-		}
-		src := base + uint8(i)
-		c.compileAssignTarget(target, src)
+	// Step 3: assign each RHS temp to the (already-resolved) target.
+	for i := 0; i < nvars; i++ {
+		src := rhsBase + uint8(i)
+		c.emitAssignFromDesc(s.Vars[i], descs[i], src)
 	}
 	fc.pb.setTop(base)
+}
+
+// lvalueDesc snapshots a multi-assignment LHS target after its
+// addressing sub-expressions have been evaluated. The destination is
+// frozen here so subsequent writes to other LHS slots cannot affect
+// where this slot is written.
+type lvalueDesc struct {
+	kind     lvalueKind
+	objReg   uint8  // for indexname/indexexpr/indexnum: register holding the table
+	keyReg   uint8  // for indexexpr: register holding the key
+	smallIdx uint8  // for indexnum: 1-based small int key in [1,256] (encoded as i)
+	// objIsTemp/keyIsTemp record whether we allocated a fresh temp so
+	// emitAssignFromDesc can release them later.
+	objIsTemp bool
+	keyIsTemp bool
+}
+
+type lvalueKind uint8
+
+const (
+	lvLocal lvalueKind = iota
+	lvUpval
+	lvGlobal
+	lvIndexName
+	lvIndexNum
+	lvIndexExpr
+)
+
+// preEvalLValue resolves a LHS target and pre-computes any table/key
+// registers needed to assign to it. Locals/upvalues/globals require no
+// pre-evaluation. For indexed targets we allocate fresh temps and
+// emit code to evaluate obj (and key) into them now -- this is what
+// guarantees that an earlier LHS write to a local cannot disturb a
+// later LHS index expression that read that local.
+func (c *compiler) preEvalLValue(target ast.Expr) lvalueDesc {
+	fc := c.cur()
+	switch t := target.(type) {
+	case *ast.ExprLocal:
+		return lvalueDesc{kind: lvLocal}
+	case *ast.ExprGlobal:
+		return lvalueDesc{kind: lvGlobal}
+	case *ast.ExprIndexName:
+		obj := fc.pb.reserveReg(1)
+		c.compileExprToReg(t.Expr, obj)
+		return lvalueDesc{kind: lvIndexName, objReg: obj, objIsTemp: true}
+	case *ast.ExprIndexExpr:
+		// Specialize small int key to SETTABLEN: no key reg needed.
+		if nlit, ok := t.Index.(*ast.ExprConstantNumber); ok {
+			if idx, isInt := smallIndexLiteral(nlit.Value); isInt {
+				obj := fc.pb.reserveReg(1)
+				c.compileExprToReg(t.Expr, obj)
+				return lvalueDesc{kind: lvIndexNum, objReg: obj, smallIdx: idx, objIsTemp: true}
+			}
+		}
+		obj := fc.pb.reserveReg(1)
+		c.compileExprToReg(t.Expr, obj)
+		key := fc.pb.reserveReg(1)
+		c.compileExprToReg(t.Index, key)
+		return lvalueDesc{kind: lvIndexExpr, objReg: obj, keyReg: key, objIsTemp: true, keyIsTemp: true}
+	default:
+		c.raise(target.Loc(), "compiler: cannot assign to %T", target)
+		return lvalueDesc{}
+	}
+}
+
+// emitAssignFromDesc writes src into the location described by d.
+// target is only consulted for fields not captured in d (local reg,
+// upvalue id, global name string).
+func (c *compiler) emitAssignFromDesc(target ast.Expr, d lvalueDesc, src uint8) {
+	fc := c.cur()
+	switch d.kind {
+	case lvLocal:
+		t := target.(*ast.ExprLocal)
+		dst, ok := c.resolveLocalReg(t.Local)
+		if ok && !t.Upvalue {
+			if dst != src {
+				fc.pb.emitABC(common.OpMove, dst, src, 0)
+			}
+			return
+		}
+		uid := c.resolveUpvalue(t.Local)
+		fc.pb.emitABC(common.OpSetUpval, src, uid, 0)
+	case lvGlobal:
+		t := target.(*ast.ExprGlobal)
+		sidx := fc.pb.addStringConstant(t.Name)
+		fc.pb.emitABC(common.OpSetGlobal, src, 0, 0)
+		fc.pb.emitAux(sidx)
+	case lvIndexName:
+		t := target.(*ast.ExprIndexName)
+		sidx := fc.pb.addStringConstant(t.IndexName)
+		fc.pb.emitABC(common.OpSetTableKS, src, d.objReg, 0)
+		fc.pb.emitAux(sidx)
+	case lvIndexNum:
+		fc.pb.emitABC(common.OpSetTableN, src, d.objReg, d.smallIdx)
+	case lvIndexExpr:
+		fc.pb.emitABC(common.OpSetTable, src, d.objReg, d.keyReg)
+	}
 }
 
 func (c *compiler) compileAssignTarget(target ast.Expr, src uint8) {
@@ -595,11 +731,15 @@ func (c *compiler) compileWhile(s *ast.StatWhile) {
 	// Compile condition; jump to end on falsy.
 	jmpEnd := c.compileCondJump(s.Condition, false)
 
-	// Set up loop context for break/continue.
+	// Set up loop context for break/continue. closeReg is the current
+	// top: any locals declared inside the body live at >= top.
 	prevLoop := fc.loop
 	loop := &loopCtx{
 		parent:        prevLoop,
 		localsAtEntry: len(fc.localStack),
+		closeReg:      fc.pb.top,
+		breakClose:    true,
+		continueClose: true,
 	}
 	fc.loop = loop
 
@@ -631,6 +771,12 @@ func (c *compiler) compileRepeat(s *ast.StatRepeat) {
 	loop := &loopCtx{
 		parent:        prevLoop,
 		localsAtEntry: len(fc.localStack),
+		closeReg:      fc.pb.top,
+		// repeat...until: break closes body locals (we exit the loop)
+		// but continue must NOT close them because the until
+		// expression evaluated next can still reference them.
+		breakClose:    true,
+		continueClose: false,
 	}
 	fc.loop = loop
 
@@ -643,6 +789,15 @@ func (c *compiler) compileRepeat(s *ast.StatRepeat) {
 	topBefore := fc.pb.top
 	for _, stat := range s.Body.Body {
 		c.compileStat(stat)
+	}
+
+	// Close any upvalues captured into body locals before the
+	// back-edge: each iteration of `repeat` needs a fresh set of body
+	// locals. Emit BEFORE the continue-patch point so `continue` (which
+	// jumps to the until-check landing) skips this CLOSEUPVALS and the
+	// until expression still sees the body locals' open upvalues.
+	if !c.lastInsnIsUnreachableTerminator() && fc.pb.top > topBefore {
+		fc.pb.emitABC(common.OpCloseUpvals, topBefore, 0, 0)
 	}
 
 	// Patch continue jumps to the until check.
@@ -684,6 +839,12 @@ func (c *compiler) compileBreak(s *ast.StatBreak) {
 	if fc.loop == nil {
 		c.raise(s.Location, "compiler: break outside of loop")
 	}
+	// Close any upvalues captured by loop-body locals before jumping
+	// out of the loop -- otherwise their open upvalues would alias
+	// stack slots reused by code after the loop.
+	if fc.loop.breakClose {
+		fc.pb.emitABC(common.OpCloseUpvals, fc.loop.closeReg, 0, 0)
+	}
 	pc := fc.pb.pc()
 	fc.pb.emitAD(common.OpJump, 0, 0)
 	fc.loop.breakPCs = append(fc.loop.breakPCs, pc)
@@ -693,6 +854,9 @@ func (c *compiler) compileContinue(s *ast.StatContinue) {
 	fc := c.cur()
 	if fc.loop == nil {
 		c.raise(s.Location, "compiler: continue outside of loop")
+	}
+	if fc.loop.continueClose {
+		fc.pb.emitABC(common.OpCloseUpvals, fc.loop.closeReg, 0, 0)
 	}
 	pc := fc.pb.pc()
 	fc.pb.emitAD(common.OpJump, 0, 0)
@@ -734,10 +898,23 @@ func (c *compiler) compileFor(s *ast.StatFor) {
 	loop := &loopCtx{
 		parent:        prevLoop,
 		localsAtEntry: len(fc.localStack),
+		closeReg:      base + 2,
+		breakClose:    true,
+		continueClose: true,
 	}
 	fc.loop = loop
 
 	c.compileBlock(s.Body)
+
+	// Close any upvalues that captured the loop variable (base+2) or
+	// any other slot at or above it. Without this, when closures inside
+	// the body capture the index, they all share one upvalue across
+	// iterations -- breaking `for i=1,N do a[i]=function() return i end`.
+	// CLOSEUPVALS at A=base+2 is a no-op if no upvalue is open at that
+	// level, so it's safe to emit unconditionally for the back-edge.
+	if !c.lastInsnIsUnreachableTerminator() {
+		fc.pb.emitABC(common.OpCloseUpvals, base+2, 0, 0)
+	}
 
 	// Patch continue jumps to the FORNLOOP.
 	loopPC := fc.pb.pc()
@@ -751,7 +928,8 @@ func (c *compiler) compileFor(s *ast.StatFor) {
 	// Patch FORNPREP to skip body when init violates termination.
 	c.patchJumpTo(prepPC, fc.pb.pc())
 
-	// Patch break jumps to here.
+	// Patch break jumps to here. compileBreak already emitted a
+	// CLOSEUPVALS before the JUMP, so we don't need another one here.
 	for _, pc := range loop.breakPCs {
 		c.patchJumpTo(pc, fc.pb.pc())
 	}
@@ -836,10 +1014,20 @@ func (c *compiler) compileForIn(s *ast.StatForIn) {
 	loop := &loopCtx{
 		parent:        prevLoop,
 		localsAtEntry: len(fc.localStack),
+		closeReg:      base + 3,
+		breakClose:    true,
+		continueClose: true,
 	}
 	fc.loop = loop
 
 	c.compileBlock(s.Body)
+
+	// Close any upvalues that captured the loop variables (>= base+3)
+	// at the back-edge so each iteration's closures get a fresh
+	// upvalue. Mirrors the numeric for-loop fix; see compileFor.
+	if !c.lastInsnIsUnreachableTerminator() {
+		fc.pb.emitABC(common.OpCloseUpvals, base+3, 0, 0)
+	}
 
 	// Patch continue to FORGLOOP.
 	loopPC := fc.pb.pc()
@@ -854,7 +1042,8 @@ func (c *compiler) compileForIn(s *ast.StatForIn) {
 	// Patch FORGPREP to here (D=jump-to-FORGLOOP).
 	c.patchJumpTo(prepPC, loopPC)
 
-	// Patch breaks to after FORGLOOP.
+	// Patch breaks to after FORGLOOP. compileBreak already emitted a
+	// CLOSEUPVALS for the captured loop vars before jumping.
 	for _, pc := range loop.breakPCs {
 		c.patchJumpTo(pc, fc.pb.pc())
 	}

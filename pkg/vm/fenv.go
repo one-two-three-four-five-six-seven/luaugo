@@ -37,7 +37,10 @@ func (s *State) ClosureEnvAt(idx int) (envIdx int, ok bool) {
 		return 0, false
 	}
 	si.push(tableValue(cl.env))
-	return si.top - 1, true
+	// Return a callBase-relative positive index so the caller can
+	// pass it back to PushValue / Replace / Type / etc. without
+	// the absIndex(positive) callBase translation skewing it.
+	return si.top - si.callBase, true
 }
 
 // SetClosureEnvAt sets the environment of the function at funcIdx to
@@ -92,7 +95,8 @@ func (s *State) ClosureAtLevel(level int) (closureIdx int, ok bool) {
 		return 0, false
 	}
 	si.push(closureValue(ci.cl))
-	return si.top - 1, true
+	// Return a callBase-relative positive index (see ClosureEnvAt).
+	return si.top - si.callBase, true
 }
 
 // PushThreadGlobals pushes the thread's globals table. Distinct from

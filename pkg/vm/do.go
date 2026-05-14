@@ -421,8 +421,17 @@ func (s *stateImpl) pcallFromGo(nargs, nresults, errfunc int) (st Status) {
 			for len(s.frames) > savedFrames {
 				s.popFrame()
 			}
-			// Close any upvalues that escaped during the abort.
-			s.closeUpvalsTo(savedTop)
+			// Close any open upvalues that escaped during the abort.
+			// We close everything at or above the called function's
+			// base (funcIdx+1), not just above savedTop: arguments
+			// live between funcIdx+1 and savedTop-1, and a callee
+			// may have captured those slots into closures. Without
+			// closing them, an outer closure that captured a
+			// stack-slot of a now-unwound frame would dangle and
+			// alias whatever future code writes into that slot --
+			// e.g. closure.luau:121 where `b` captures `x` from `f`
+			// via pcall(f, 4) and later calls b('set', 10).
+			s.closeUpvalsTo(funcIdx + 1)
 			// Restore top to the function slot.
 			if savedTop > cap(s.stack) {
 				s.reserve(savedTop - s.top)
