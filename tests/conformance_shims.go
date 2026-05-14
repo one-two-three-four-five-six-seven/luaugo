@@ -156,17 +156,34 @@ func installConformanceShims(s *vm.State) {
 		return 1
 	})
 	s.Register("multipleYieldsWithNestedCall", func(state *vm.State) int {
+		// Mirrors upstream Conformance.test.cpp:1506-1565 collapsed
+		// from the continuation-based form into a sequential shim
+		// (we don't model lua_yieldk/continuations). The expected
+		// yield sequence:
+		//   shouldYield=true:  yields x+95, x+105 (from helper +
+		//                      continuation), x+200, returns x+210.
+		//   shouldYield=false: yields x+100, x+200, returns x+210.
+		// `context` constant inside multipleYieldsWithNestedCall is
+		// 5, so helper-yield = 100+5 = 105 (or +x for our scaled
+		// form). conformance/cyield.luau:32-44 / 49-51 check these
+		// values.
 		x := int64(10)
 		if v, ok := state.ToInteger(1); ok {
 			x = v
 		}
-		state.PushInteger(x + 95)
+		shouldYield := state.ToBoolean(2)
+		if shouldYield {
+			state.PushInteger(x + 95) // helper yields 100+context=105 (+x-10 baseline)
+			state.Yield(1)
+			state.PushInteger(x + 105) // continuation state=0 yields stacked val
+			state.Yield(1)
+		} else {
+			state.PushInteger(x + 100) // helper returns 105+context=110 (+x-10)
+			state.Yield(1)
+		}
+		state.PushInteger(x + 200) // continuation state=1 yields x+200
 		state.Yield(1)
-		state.PushInteger(x + 105)
-		state.Yield(1)
-		state.PushInteger(x + 200)
-		state.Yield(1)
-		state.PushInteger(x + 210)
+		state.PushInteger(x + 210) // continuation state=2 returns x+210
 		return 1
 	})
 
