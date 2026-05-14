@@ -7,6 +7,7 @@ package vm
 
 import (
 	"github.com/one-two-three-four-five-six-seven/luaugo/internal/common"
+	"github.com/one-two-three-four-five-six-seven/luaugo/internal/vmlog"
 	"github.com/one-two-three-four-five-six-seven/luaugo/pkg/bytecode"
 )
 
@@ -19,6 +20,28 @@ import (
 //   - `pc` is the integer index into code (NOT a pointer like upstream).
 //   - `base` is ci.base, the index of R(0) in the thread stack.
 //   - register access: rA, rB, rC return *value pointers; sR(A, v) stores.
+
+// reframeStack re-extends L.stack so that the current Lua frame still
+// has room for its declared register window after a callee shrank the
+// backing slice. Call this immediately after any L.stack = L.stack[:L.top]
+// inside an executing Lua frame; without it the next register access
+// can panic with "index out of range".
+//
+// The function preserves the existing slice contents and never lowers
+// L.top -- it only grows the slice up to base+MaxStackSize.
+func reframeStack(L *stateImpl, base int, maxStack uint8) {
+	needLen := base + int(maxStack)
+	if len(L.stack) >= needLen {
+		return
+	}
+	if cap(L.stack) >= needLen {
+		L.stack = L.stack[:needLen]
+		return
+	}
+	grow := make([]value, needLen, needLen+(needLen/2))
+	copy(grow, L.stack)
+	L.stack = grow
+}
 
 // executeProto runs the bytecode of ci until the function returns,
 // yields, or raises an error. On normal return the results are placed
@@ -34,6 +57,11 @@ func executeProto(L *stateImpl, ci *callInfo) {
 		pc := ci.savedpc
 		base := ci.base
 		constants := getProtoCache(L.gs).constants[p]
+		// On every frame entry / re-entry restore this frame's register
+		// window. The previous frame may have shrunk L.stack to its own
+		// L.top during its return; without this we'd panic on the next
+		// register write into the current frame.
+		reframeStack(L, base, p.MaxStackSize)
 
 		// Inner dispatch loop.
 	dispatch:
@@ -294,31 +322,32 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				ci.top = L.top
 				// Function is at base+a; args at base+a+1..
 				funcIdx := base + int(a)
+				if vmlog.Enabled("call") {
+					vmlog.V("call", "OpCall funcIdx=%d nargs=%d nresults=%d L.top(pre)=%d len(stack)=%d",
+						funcIdx, nargs, nresults, L.top, len(L.stack))
+				}
+				savedTop := ci.top
 				L.callValue(funcIdx, nargs, nresults)
 				if nresults != MultRet {
-					L.top = funcIdx + nresults
+					// For fixed nresults, restore the caller's L.top
+					// to its pre-call value. This matches upstream's
+					// `L->top = ci->top` after `luaD_call`.
+					// The actual return slots remain populated at
+					// [funcIdx, funcIdx+nresults).
+					L.top = savedTop
 					if L.top > len(L.stack) {
 						L.reserve(L.top - len(L.stack))
 					}
 					L.stack = L.stack[:L.top]
 				}
-				// After the call, the callee may have shrunk the
-				// backing slice below the parent's MaxStackSize area
-				// (this is the case for any Go function that pops
-				// values during its execution). Subsequent register
-				// writes inside this Lua frame need those slots back,
-				// so we re-extend the slice to base+MaxStackSize
-				// without touching L.top (which still records the
-				// post-return free slot for multret) and without
-				// zeroing surviving register values.
-				if needLen := base + int(cl.proto.MaxStackSize); len(L.stack) < needLen {
-					if cap(L.stack) < needLen {
-						grow := make([]value, needLen, needLen+(needLen/2))
-						copy(grow, L.stack)
-						L.stack = grow
-					} else {
-						L.stack = L.stack[:needLen]
-					}
+				// Restore the parent frame's register window: a callee
+				// that popped its stack down (Go callees in particular)
+				// can leave the slice too short for the next register
+				// write inside this Lua frame.
+				reframeStack(L, base, p.MaxStackSize)
+				if vmlog.Enabled("call") {
+					vmlog.V("call", "OpCall post-return L.top=%d len(stack)=%d ra=%v",
+						L.top, len(L.stack), L.stack[funcIdx])
 				}
 
 			case common.OpReturn:
@@ -550,8 +579,16 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				lo := base + int(b)
 				hi := base + int(c)
 				n := hi - lo + 1
+				if vmlog.Enabled("concat") {
+					for i := 0; i < n; i++ {
+						vmlog.V("concat", "  in[%d] reg=%d tag=%v val=%v", i, b+uint8(i), L.stack[lo+i].tag, L.stack[lo+i])
+					}
+				}
 				L.doConcat(lo, n)
 				L.stack[base+int(a)] = L.stack[lo]
+				if vmlog.Enabled("concat") {
+					vmlog.V("concat", "  result tag=%v val=%v", L.stack[base+int(a)].tag, L.stack[base+int(a)])
+				}
 
 			case common.OpNot:
 				b := common.InsnB(insn)
@@ -712,6 +749,7 @@ func executeProto(L *stateImpl, ci *callInfo) {
 					}
 					L.stack = L.stack[:L.top]
 				}
+				reframeStack(L, base, p.MaxStackSize)
 				for i := 0; i < want; i++ {
 					if i < varargs {
 						L.stack[base+int(a)+i] = L.stack[ci.varargBase+i]
@@ -785,6 +823,9 @@ func executeProto(L *stateImpl, ci *callInfo) {
 								L.stack[ra+i] = nilValue()
 							}
 						}
+						// Restore parent's register window after the
+						// fast path may have shrunk the slice.
+						reframeStack(L, base, p.MaxStackSize)
 						// Skip past the CALL.
 						pc += skip + 1
 						continue
