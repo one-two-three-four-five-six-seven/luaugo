@@ -442,7 +442,9 @@ func baseNewProxy(s *vm.State) int {
 		s.LError("invalid argument #1 to 'newproxy' (nil or boolean expected)")
 	}
 	needsMt := s.ToBoolean(1)
-	_ = s.NewUserdata(0)
+	// Tag with UTagProxy so typeof() refuses to honor __type on this
+	// userdata, matching upstream luaB_newproxy (lbaselib.cpp:453).
+	_ = s.NewUserdataTagged(0, vm.UTagProxy)
 	if needsMt {
 		s.NewTable()
 		s.SetMetatable(-2)
@@ -695,8 +697,14 @@ func baseTypeof(s *vm.State) int {
 	if s.Top() < 1 {
 		s.LError("missing argument #1 to 'typeof'")
 	}
-	// For userdata, return __type if set.
-	if s.Type(1) == vm.TUserdata {
+	// For userdata, return __type if set EXCEPT for proxy userdata
+	// (those created by newproxy). Upstream luaT_objtypenamestr
+	// (VM/src/ltm.cpp:119) explicitly excludes UTAG_PROXY userdata
+	// from __type honoring -- the comment in conformance/basic.luau:
+	// "__type doesn't work intentionally to avoid spoofing". Without
+	// this exemption, a script could forge typeof() == "number" on
+	// a proxy and bypass type checks.
+	if s.Type(1) == vm.TUserdata && s.UserdataTag(1) != vm.UTagProxy {
 		if s.LGetMetafield(1, "__type") {
 			if s.Type(-1) == vm.TString {
 				return 1

@@ -14,6 +14,15 @@ package vm
 // invokes f() if non-nil. The Lua-level __gc metamethod (when bound to
 // a closure) is invoked by the higher-level finalisation pass and
 // translated into this Go callback.
+//
+// UTagProxy is the sentinel tag stored on userdata returned by
+// newproxy. Upstream uses UTAG_PROXY (LUA_UTAG_LIMIT+1 == 129) so the
+// __type metamethod is intentionally ignored for proxies -- otherwise
+// scripts could spoof the typeof() of arbitrary Go-side userdata.
+// We pick 129 to match upstream's numeric value, though only the
+// distinction "==UTagProxy or not" matters here.
+const UTagProxy byte = 129
+
 type userdata struct {
 	gcHeader
 

@@ -354,6 +354,26 @@ func (s *State) NewUserdataTagged(size int, tag byte) []byte {
 	return u.data
 }
 
+// UserdataTag returns the host-defined tag byte on the userdata at
+// idx, or 0 if idx does not hold a userdata. Mirrors upstream
+// lua_userdatatag.
+func (s *State) UserdataTag(idx int) byte {
+	si := s.impl
+	i := si.absIndex(idx)
+	if i < 0 || i >= si.top {
+		return 0
+	}
+	v := si.stack[i]
+	if v.tag != TUserdata || v.gc == nil {
+		return 0
+	}
+	u, ok := v.gc.(*userdata)
+	if !ok || u == nil {
+		return 0
+	}
+	return u.tag
+}
+
 // NewUserdataDtor allocates a userdata whose Go finalizer is run when
 // it becomes unreachable.
 func (s *State) NewUserdataDtor(obj any, dtor func()) {

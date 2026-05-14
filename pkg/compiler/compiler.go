@@ -627,24 +627,78 @@ func (c *compiler) compileAssignTarget(target ast.Expr, src uint8) {
 
 func (c *compiler) compileCompoundAssign(s *ast.StatCompoundAssign) {
 	fc := c.cur()
-	// load var → tmp; tmp = tmp op value; store tmp → var
 	base := fc.pb.top
+
+	// Side-effect-correct lowering: evaluate the target's obj/key
+	// sub-expressions exactly once, do GET into tmp, do the op, and
+	// reuse the cached obj/key for the SET. conformance/basic.luau:976
+	// has `res[(function() count += 1; return count end)()] += 5`,
+	// which must invoke the index closure exactly once per compound
+	// assignment.
+	switch t := s.Var.(type) {
+	case *ast.ExprIndexName:
+		objReg := c.compileExprAsReg(t.Expr, false)
+		sidx := fc.pb.addStringConstant(t.IndexName)
+		// tmp = obj[name]
+		tmp := fc.pb.reserveReg(1)
+		fc.pb.emitABC(common.OpGetTableKS, tmp, objReg, 0)
+		fc.pb.emitAux(sidx)
+		// tmp = tmp op value
+		c.compoundOp(s.Op, tmp, s.Value)
+		// obj[name] = tmp
+		fc.pb.emitABC(common.OpSetTableKS, tmp, objReg, 0)
+		fc.pb.emitAux(sidx)
+		fc.pb.setTop(base)
+		return
+	case *ast.ExprIndexExpr:
+		objReg := c.compileExprAsReg(t.Expr, false)
+		keyReg := c.compileExprAsReg(t.Index, false)
+		tmp := fc.pb.reserveReg(1)
+		// Specialise small int constant keys to GET/SETTABLEN where
+		// possible -- saves an instruction and matches non-compound
+		// assigns.
+		if nlit, ok := t.Index.(*ast.ExprConstantNumber); ok {
+			if i, isInt := smallIndexLiteral(nlit.Value); isInt {
+				fc.pb.emitABC(common.OpGetTableN, tmp, objReg, uint8(i))
+				c.compoundOp(s.Op, tmp, s.Value)
+				fc.pb.emitABC(common.OpSetTableN, tmp, objReg, uint8(i))
+				fc.pb.setTop(base)
+				return
+			}
+		}
+		fc.pb.emitABC(common.OpGetTable, tmp, objReg, keyReg)
+		c.compoundOp(s.Op, tmp, s.Value)
+		fc.pb.emitABC(common.OpSetTable, tmp, objReg, keyReg)
+		fc.pb.setTop(base)
+		return
+	}
+
+	// Fallback for local / upvalue / global targets: simple
+	// load → op → store. No double-evaluation risk because these
+	// have no sub-expressions.
 	tmp := fc.pb.reserveReg(1)
 	c.compileExprToReg(s.Var, tmp)
-	switch s.Op {
-	case ast.BinaryConcat:
-		// Use OpConcat which requires contiguous operand regs.
-		rhs := fc.pb.reserveReg(1)
-		c.compileExprToReg(s.Value, rhs)
-		fc.pb.emitABC(common.OpConcat, tmp, tmp, rhs)
-		fc.pb.setTop(tmp + 1)
-	default:
-		rhsReg := c.compileExprAsReg(s.Value, false)
-		c.emitBinaryOp(s.Op, tmp, tmp, rhsReg)
-		c.releaseTempIfTop(s.Value, rhsReg)
-	}
+	c.compoundOp(s.Op, tmp, s.Value)
 	c.compileAssignTarget(s.Var, tmp)
 	fc.pb.setTop(base)
+}
+
+// compoundOp applies the op of a compound assignment to register tmp
+// using rhs expression `value`, storing the result back into tmp. Used
+// by all four target shapes of compileCompoundAssign.
+func (c *compiler) compoundOp(op ast.BinaryOp, tmp uint8, value ast.Expr) {
+	fc := c.cur()
+	if op == ast.BinaryConcat {
+		// OpConcat requires contiguous operand registers.
+		rhs := fc.pb.reserveReg(1)
+		c.compileExprToReg(value, rhs)
+		fc.pb.emitABC(common.OpConcat, tmp, tmp, rhs)
+		fc.pb.setTop(tmp + 1)
+		return
+	}
+	rhsReg := c.compileExprAsReg(value, false)
+	c.emitBinaryOp(op, tmp, tmp, rhsReg)
+	c.releaseTempIfTop(value, rhsReg)
 }
 
 func (c *compiler) compileStatExpr(s *ast.StatExpr) {
