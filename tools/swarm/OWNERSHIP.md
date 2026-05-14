@@ -34,35 +34,25 @@ Updated by the orchestrator at the start of each swarm. Empty when no
 swarm is running.
 
 ```
-swarm: bug-fix-batch-2 (active)
-baseline: master @ 3e698b7
-agents:
-  - fix-basic:
-      target: tests/conformance/basic.luau move RUNTIME_ERR -> OK
-      worktree: .swarm/fix-basic
-      owned:
-        - pkg/vm/arith.go
-        - pkg/vm/compare.go
-        - pkg/vm/object.go
-        - pkg/vm/basic_fix_test.go (NEW)
-  - fix-tpack:
-      target: tests/conformance/tpack.luau move RUNTIME_ERR -> OK
-      worktree: .swarm/fix-tpack
-      owned:
-        - pkg/vm/lib/string.go
-        - pkg/vm/lib/string_pack_test.go (NEW)
-        - pkg/vm/lib/tpack_fix_test.go (NEW)
-  - fix-pcall-errors:
-      target: tests/conformance/pcall.luau and tests/conformance/errors.luau
-      worktree: .swarm/fix-pcall-errors
-      owned:
-        - pkg/vm/do.go
-        - pkg/vm/api.go
-        - pkg/vm/auxlib.go
-        - pkg/vm/lib/base.go
-        - pkg/vm/pcall_fix_test.go (NEW)
-        - pkg/vm/lib/errors_fix_test.go (NEW)
+swarm: (none active)
+baseline: (n/a)
+agents: []
 ```
+
+## Recent swarm history
+
+### bug-fix-batch-2 (completed at master @ 0fa87d0)
+
+baseline: master @ 3e698b7
+
+| agent | target | files changed | outcome |
+|---|---|---|---|
+| fix-basic | basic.luau | pkg/vm/arith.go + new test | Real bug fixed (concat wording). Fixture still RUNTIME_ERR at line 188 (out-of-scope compiler bug). |
+| fix-tpack | tpack.luau | pkg/vm/lib/string.go + new tests | Fixture flipped to OK. Four pack/unpack bugs fixed. |
+| fix-pcall-errors | pcall.luau, errors.luau | pkg/vm/do.go + new tests | Two real bugs fixed (recursion off-by-one, error prefix). Fixtures still RUNTIME_ERR (out-of-scope debug-lib gaps). |
+
+Net suite-wide change: 26/53 -> 27/53. Zero agent conflicts.
+Coordination layer (isolated worktrees + ownership map) proved out.
 
 ## Recent swarm history
 
