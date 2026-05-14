@@ -675,9 +675,23 @@ func executeProto(L *stateImpl, ci *callInfo) {
 				}
 				t := tv.gc.(*table)
 				startIdx := int(aux)
-				for i := 0; i < count; i++ {
-					t.setNum(L.gs, startIdx+i, L.stack[base+int(b)+i])
+				// Mirror upstream lvmexecute.cpp:LOP_SETLIST: grow
+				// the array part to fit [startIdx, startIdx+count)
+				// before writing, then write directly. This avoids
+				// routing through set()/rehash() per element, which
+				// would push elements into the hash part when an
+				// earlier hash-side rehash had shrunk the array
+				// below NEWTABLE's pre-sized capacity (notably for
+				// `{1,2,3,nil,4, a=5,b=6,c=7}` style constructors
+				// where SETTABLEKS fires before SETLIST).
+				last := startIdx + count - 1
+				if last > len(t.array) {
+					t.setArrayVector(last)
 				}
+				for i := 0; i < count; i++ {
+					t.array[startIdx+i-1] = L.stack[base+int(b)+i]
+				}
+				t.tmcache = 0
 
 			case common.OpForNPrep:
 				d := common.InsnD(insn)
