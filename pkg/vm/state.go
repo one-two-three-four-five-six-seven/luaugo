@@ -330,16 +330,42 @@ func (s *State) checkStack(n int) bool {
 	if n < 0 {
 		return false
 	}
-	// Mirror upstream lua_checkstack: refuse if either the request
-	// alone, or the resulting top, would exceed LUAI_MAXCSTACK
-	// (8000 slots). conformance/tables.luau:670-677 exercises this
-	// by calling `table.unpack(b)` on an 8000-element table, which
-	// must surface as "too many results to unpack".
+	// Mirror upstream lua_checkstack's two-level gate:
+	//
+	// 1. Refuse a single request larger than LUAI_MAXCSTACK
+	//    (8000 slots). This catches conformance/tables.luau:670-677
+	//    (`table.unpack(b)` on an 8000-element table) and a per-frame
+	//    asking for too many slots in one go.
+	//
+	// 2. Refuse when the absolute thread stack would grow past
+	//    LUAI_MAXSTACK (1M slots). Upstream's stacklimitreached
+	//    path triggers this when deeply recursive code accumulates
+	//    enough live frames to exhaust the stack array. With
+	//    frame-relative growth, conformance/gc.luau:235's
+	//    recurse(100) cap-stays below this limit and succeeds;
+	//    conformance/calls.luau:262's recurse(19000) crosses it
+	//    and surfaces "too many results to unpack" as required.
 	const LUAI_MAXCSTACK = 8000
-	if n > LUAI_MAXCSTACK || s.impl.top+n > LUAI_MAXCSTACK {
+	const LUAI_MAXSTACK = 1 << 20 // 1 MiB slots
+	if n > LUAI_MAXCSTACK {
 		return false
 	}
-	s.impl.reserve(n)
+	si := s.impl
+	frameBase := 0
+	if len(si.frames) > 0 {
+		frameBase = si.frames[len(si.frames)-1].base
+	}
+	frameUsed := si.top - frameBase
+	if frameUsed < 0 {
+		frameUsed = 0
+	}
+	if frameUsed+n > LUAI_MAXCSTACK {
+		return false
+	}
+	if si.top+n > LUAI_MAXSTACK {
+		return false
+	}
+	si.reserve(n)
 	return true
 }
 
