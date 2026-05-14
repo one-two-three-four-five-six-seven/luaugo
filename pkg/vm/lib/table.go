@@ -550,23 +550,25 @@ func tabIlog2(n int) int {
 
 // sortLess returns true if t[i] < t[j] using either `<` or the
 // supplied comparator. Detects "table modified during sorting" by
-// re-measuring length before and after the comparator call.
+// comparing the table's underlying array+hash shape before and after
+// the comparator call -- a mutation that resizes either part
+// (typically a hash-key assignment that triggers a rehash, like
+// conformance/sort.luau:102 does via loadstring) trips this check
+// before the sort algorithm can observe an inconsistent ordering.
 func sortLess(s *vm.State, i, j int, hasComp bool) bool {
 	curLen := tableLibLen(s, 1)
 	if i < 1 || i > curLen || j < 1 || j > curLen {
 		s.LError("table modified during sorting")
 	}
+	preArr, preHash := s.TableShape(1)
 	s.RawGetI(1, i)
 	s.RawGetI(1, j)
 	var res bool
 	if hasComp {
-		// stack: vi vj
-		// Push comparator then args: comp, vi, vj.
 		s.PushValue(2) // comp
 		s.PushValue(-3)
 		s.PushValue(-3)
 		s.Call(2, 1)
-		// stack: vi vj result
 		res = s.ToBoolean(-1)
 		s.Pop(3)
 	} else {
@@ -574,6 +576,9 @@ func sortLess(s *vm.State, i, j int, hasComp bool) bool {
 		s.Pop(2)
 	}
 	if tableLibLen(s, 1) != curLen {
+		s.LError("table modified during sorting")
+	}
+	if a, h := s.TableShape(1); a != preArr || h != preHash {
 		s.LError("table modified during sorting")
 	}
 	return res

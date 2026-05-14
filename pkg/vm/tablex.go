@@ -35,6 +35,20 @@ func (s *State) GetReadonly(idx int) bool {
 	return si.stack[i].gc.(*table).readonly
 }
 
+// TableShape returns the underlying (arraySize, hashSize) of the
+// table at idx. Stable across reads but changes whenever a rehash
+// fires; sort_less uses this to detect "table modified during
+// sorting" matching upstream's `t->sizearray != n` check.
+func (s *State) TableShape(idx int) (arraySize, hashSize int) {
+	si := s.impl
+	i := si.absIndex(idx)
+	if i < 0 || i >= si.top || si.stack[i].tag != TTable {
+		return 0, 0
+	}
+	t := si.stack[i].gc.(*table)
+	return len(t.array), len(t.nodes)
+}
+
 // CloneTable pushes a shallow copy of the table at idx onto the
 // stack. The clone preserves the metatable pointer but is never
 // frozen, regardless of the source's frozen state. Mirrors upstream
