@@ -125,6 +125,89 @@ func (s *State) PushFunc(level int) bool {
 	return true
 }
 
+// ClosureInfo describes a function value pushed on the stack without
+// requiring a live call frame. Used by debug.info's function-form to
+// answer "a" (nparams, vararg), "s" (source), "l" (linedefined) and
+// "n" (name) without consulting the call stack.
+type ClosureInfo struct {
+	IsGo        bool   // true if the value is a Go closure ("C" in upstream)
+	Name        string // debugName (Go) or proto.DebugName (Lua)
+	Source      string // chunkname (Lua); "[C]" for Go
+	LineDefined int    // proto.LineDefined; -1 for Go
+	NumParams   int    // proto.NumParams; 0 for Go
+	IsVararg    bool   // proto.IsVararg != 0; true for Go (treated as fully variadic)
+	Valid       bool   // false if idx didn't hold a function
+}
+
+// ClosureInfoAt returns introspection info for the function value at
+// idx. Mirrors lua_getinfo invoked on a value rather than a frame.
+func (s *State) ClosureInfoAt(idx int) ClosureInfo {
+	var ci ClosureInfo
+	si := s.impl
+	i := si.absIndex(idx)
+	if i < 0 || i >= si.top {
+		return ci
+	}
+	v := si.stack[i]
+	if v.tag != TFunction || v.gc == nil {
+		return ci
+	}
+	cl, ok := v.gc.(*closure)
+	if !ok || cl == nil {
+		return ci
+	}
+	ci.Valid = true
+	if cl.isGo {
+		ci.IsGo = true
+		ci.Name = cl.debugName
+		ci.Source = "[C]"
+		ci.LineDefined = -1
+		// "C functions are treated as fully variadic"
+		// (conformance/debug.luau:99 commentary).
+		ci.NumParams = 0
+		ci.IsVararg = true
+		return ci
+	}
+	p := cl.proto
+	if p == nil {
+		return ci
+	}
+	ci.Source = chunkNameForProto(s.impl.gs, p)
+	if ci.Source == "" {
+		ci.Source = "?"
+	}
+	ci.LineDefined = int(p.LineDefined)
+	ci.Name = protoName(s.impl.gs, p)
+	ci.NumParams = int(p.NumParams)
+	ci.IsVararg = p.IsVararg != 0
+	return ci
+}
+
+// ClosureName returns the registered debugName of the function value
+// at idx, or "" if the slot does not hold a Go closure with a
+// registered name. Mirrors the path lua_getinfo "n" takes when the
+// requested function is a C closure registered through luaL_register.
+func (s *State) ClosureName(idx int) string {
+	si := s.impl
+	i := si.absIndex(idx)
+	if i < 0 || i >= si.top {
+		return ""
+	}
+	v := si.stack[i]
+	if v.tag != TFunction || v.gc == nil {
+		return ""
+	}
+	cl, ok := v.gc.(*closure)
+	if !ok || cl == nil {
+		return ""
+	}
+	if cl.isGo {
+		return cl.debugName
+	}
+	// Lua closure: use the proto's DebugName when available.
+	return protoName(s.impl.gs, cl.proto)
+}
+
 // PushFuncFrom pushes the function value of the frame `level` deep
 // inside the source State `from` onto the receiver's stack. Returns
 // true if the frame exists. Cross-thread variant of PushFunc, needed

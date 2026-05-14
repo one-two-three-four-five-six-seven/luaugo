@@ -96,7 +96,6 @@ func debugInfo(s *vm.State) int {
 	// of cold closures requires VM-level cooperation that isn't yet
 	// surfaced through the public State API.
 	var info vm.DebugInfo
-	var fnIsGo bool
 	if fnIdx == 0 {
 		var ok bool
 		info, ok = target.GetInfo(level)
@@ -104,18 +103,15 @@ func debugInfo(s *vm.State) int {
 			return 0
 		}
 	} else {
+		// First, see if the function value happens to also be on the
+		// call stack (e.g. self-recursive call). If so, promote to
+		// the level-form so we get current-line and source info.
 		if frameLevel, ok := frameLevelForFunction(s, fnIdx); ok {
 			if di, ok2 := s.GetInfo(frameLevel); ok2 {
 				info = di
-				fnIsGo = info.What == "Go"
-				fnIdx = 0 // treat as level-form from here on
+				fnIdx = 0
 				level = frameLevel
 			}
-		}
-		if fnIdx != 0 {
-			// Not on the stack. Heuristically classify by scanning
-			// the known builtin tables for an identity match.
-			fnIsGo = isRegisteredGoBuiltin(s, fnIdx)
 		}
 	}
 
@@ -133,29 +129,32 @@ func debugInfo(s *vm.State) int {
 
 		switch c {
 		case 's':
-			switch {
-			case fnIdx != 0 && fnIsGo:
-				// Function-form lookup for a function classified as
-				// a Go closure. Upstream luaO_chunkid maps the proto
-				// source "=[C]" / NULL down to the bare "[C]" tag.
-				s.PushString("[C]")
-			case fnIdx != 0:
-				// Lua function not on stack; we don't have access to
-				// its proto from lib. Best we can do is "[Lua]".
-				s.PushString("[Lua]")
-			default:
+			if fnIdx != 0 {
+				// Function-form: introspect the proto directly so
+				// Lua closures report their chunkname rather than
+				// the generic "[Lua]" fallback.
+				ci := s.ClosureInfoAt(fnIdx)
+				if ci.IsGo {
+					s.PushString("[C]")
+				} else {
+					s.PushString(ci.Source)
+				}
+			} else {
 				s.PushString(info.Source)
 			}
 			results++
 
 		case 'l':
 			if fnIdx != 0 {
-				// Function-form: no current-line for a value that
-				// isn't running. Upstream returns -1 for C functions
-				// and the linedefined for Lua functions; we can't
-				// access linedefined without proto introspection, so
-				// we conservatively return -1 here.
-				s.PushInteger(-1)
+				// Function-form: upstream returns -1 for C functions
+				// and the proto's LineDefined for Lua functions. With
+				// proto introspection we can do that exactly.
+				ci := s.ClosureInfoAt(fnIdx)
+				if ci.IsGo {
+					s.PushInteger(-1)
+				} else {
+					s.PushInteger(int64(ci.LineDefined))
+				}
 			} else {
 				s.PushInteger(int64(info.Currentline))
 			}
@@ -163,7 +162,11 @@ func debugInfo(s *vm.State) int {
 
 		case 'n':
 			if fnIdx != 0 {
-				s.PushString("")
+				// Function-form: use the closure's registered name
+				// directly. Mirrors lua_getinfo "n" on a stand-alone
+				// function value. conformance/debug.luau:76 needs
+				// debug.info(math.sqrt, "n") == "sqrt".
+				s.PushString(s.ClosureName(fnIdx))
 			} else {
 				s.PushString(info.Name)
 			}
@@ -192,14 +195,14 @@ func debugInfo(s *vm.State) int {
 
 		case 'a':
 			switch {
-			case fnIdx != 0 && fnIsGo:
-				// Upstream: "C functions are treated as fully
-				// variadic" (debug.luau line 99): nparams=0, vararg=true.
-				s.PushInteger(0)
-				s.PushBoolean(true)
 			case fnIdx != 0:
-				s.PushInteger(0)
-				s.PushBoolean(false)
+				// Function-form: introspect proto directly for Lua
+				// closures (nparams + isvararg). Go closures are
+				// treated as fully variadic (nparams=0, vararg=true),
+				// matching upstream's conformance/debug.luau:99 note.
+				ci := s.ClosureInfoAt(fnIdx)
+				s.PushInteger(int64(ci.NumParams))
+				s.PushBoolean(ci.IsVararg)
 			default:
 				s.PushInteger(int64(info.NumParams))
 				s.PushBoolean(info.IsVararg)
