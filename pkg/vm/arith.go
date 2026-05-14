@@ -325,11 +325,16 @@ func (s *stateImpl) doConcat(base, n int) {
 		if !lOK || !rOK {
 			r, ok := s.callBinTM(topMinus2, topMinus1, TMConcat)
 			if !ok {
-				bad := topMinus2
-				if lOK {
-					bad = topMinus1
-				}
-				s.runtimeError("attempt to concatenate a " + bad.tag.String() + " value")
+				// Luau formats concat type errors as
+				//   "attempt to concatenate <lhs> with <rhs>"
+				// naming BOTH operands' types in source order, not
+				// just the offending one. This is consistent across
+				// lhs-bad, rhs-bad, and both-bad cases (verified
+				// against upstream via internal/upstreamvm).
+				// basic.luau:123 asserts on the substring
+				// "attempt to concatenate nil with string" so this
+				// formatting must be preserved verbatim.
+				s.runtimeError("attempt to concatenate " + topMinus2.tag.String() + " with " + topMinus1.tag.String())
 			}
 			s.stack[base+last-1] = r
 			s.stack[base+last] = nilValue()
