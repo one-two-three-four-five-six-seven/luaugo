@@ -533,13 +533,23 @@ func (s *State) CoStatus(co *State) string {
 	if !c.started {
 		return "suspended"
 	}
-	// Started, not finished, not the current thread: it either yielded
-	// (suspended) or is mid-resume of another coroutine (normal). We
-	// approximate by the last recorded status.
-	if co.impl.status == StatusYield {
-		return "suspended"
+	// If co is currently parked waiting on a child that transitively
+	// includes s, co is "normal" -- mid-resume rather than freshly
+	// yielded. Walk the parkedOn chain downward looking for s.
+	const maxParkWalk = 256
+	cur := c.parkedOn
+	for depth := 0; cur != nil && depth < maxParkWalk; depth++ {
+		if cur == s.impl {
+			return "normal"
+		}
+		if cur.co == nil {
+			break
+		}
+		next := cur.co.parkedOn
+		if next == cur {
+			break
+		}
+		cur = next
 	}
-	// Default to suspended for a started, non-current coroutine when
-	// the recorded status is OK (e.g. never finished a resume).
 	return "suspended"
 }

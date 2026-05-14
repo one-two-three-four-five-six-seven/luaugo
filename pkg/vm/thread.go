@@ -34,6 +34,12 @@ type coroutine struct {
 	started bool
 	// finished indicates the goroutine has terminated.
 	finished bool
+	// parkedOn is the child coroutine that this coroutine is
+	// currently waiting on inside a Resume call. nil when the
+	// coroutine is not mid-resume (suspended, running, or dead).
+	// CoStatus walks this field downward to decide whether co is
+	// "normal" (in a resume chain leading to the querying thread).
+	parkedOn *stateImpl
 }
 
 // resumeMsg is sent by the main side to the coroutine. When errPending
@@ -124,6 +130,40 @@ func (co *State) resumeImpl(from *State, nargs int) Status {
 	}
 
 	mu := getVMMutex(co.impl.gs)
+
+	// Bound the depth of coroutine resume chains. Without this cap,
+	// pathological scripts that spawn unbounded coroutine chains
+	// (e.g. `function a(arg) coroutine.wrap(arg)(arg) end; pcall(a, a)`
+	// in conformance/coroutine.luau:246-247) leak goroutines until
+	// the host runs out of memory. Upstream's gate is L->nCcalls vs
+	// LUAI_MAXCCALLS in luaD_rawrunprotected.
+	gs := co.impl.gs
+	if gs.resumeDepth >= maxCoResumeDepth {
+		errVal := stringValue(gs.intern("C stack overflow"))
+		co.impl.push(errVal)
+		co.impl.status = StatusErrRun
+		return StatusErrRun
+	}
+	gs.resumeDepth++
+	defer func() { gs.resumeDepth-- }()
+
+	// Track the resume relationship so CoStatus can report `from`
+	// (the parent we are about to park) as "normal" while co runs.
+	// We mark on the parent's coroutine struct (parkedOn = co.impl);
+	// the deferred unset fires on every exit path so no chain link
+	// outlives the Resume call.
+	var prevParkedOn *stateImpl
+	var parentCo *coroutine
+	if from != nil && from.impl.co != nil {
+		parentCo = from.impl.co
+		prevParkedOn = parentCo.parkedOn
+		parentCo.parkedOn = co.impl
+	}
+	defer func() {
+		if parentCo != nil {
+			parentCo.parkedOn = prevParkedOn
+		}
+	}()
 
 	if !c.started {
 		c.started = true

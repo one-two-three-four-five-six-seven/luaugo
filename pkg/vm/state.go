@@ -74,7 +74,26 @@ type globalState struct {
 	gcGoal      int
 	gcStepMul   int
 	gcStepSize  int
+
+	// resumeDepth counts the number of currently in-flight nested
+	// coroutine resumes on this global state. Upstream uses
+	// L->nCcalls combined with LUAI_MAXCCALLS for the same gate;
+	// without that bookkeeping we cap the depth at maxCoResumeDepth
+	// so a pathological recursive coroutine chain (coroutine.luau:
+	// 246-247's deliberate infinite recursion) errors out before
+	// goroutines accumulate beyond reasonable limits.
+	resumeDepth int
 }
+
+// maxCoResumeDepth caps simultaneously-active nested coroutine
+// resumes. Lua-level scripts that legitimately need deep chains
+// (recursive generator pipelines, coroutine-based parsers) virtually
+// never exceed a few dozen; we set the cap well above any reasonable
+// usage. The conformance fixture coroutine.luau:246 deliberately
+// spawns an unbounded chain inside a pcall, expecting a recoverable
+// "C stack overflow" error; that path is the primary consumer of
+// this gate.
+const maxCoResumeDepth = 200
 
 func newGlobalState() *globalState {
 	g := &globalState{
