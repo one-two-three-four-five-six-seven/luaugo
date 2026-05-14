@@ -99,6 +99,36 @@ const (
 // round consumes 2 frames; an off-by-one here produced 10001.
 func (s *stateImpl) pushFrame(cl *closure, base int, numresults int, flags ciFlags) *callInfo {
 	if len(s.frames)+1 >= maxCallDepth {
+		// Distinguish "C stack overflow" from plain "stack overflow".
+		// Upstream draws the line at L->nCcalls > LUAI_MAXCCALLS
+		// (Go/C call depth) vs the Lua stack-slot ceiling. We
+		// approximate: if the call we are about to push is a Go
+		// closure, OR any of the recent frames is a Go closure,
+		// the overflow happened in a C-call context and we report
+		// "C stack overflow". This catches metamethod-recursion
+		// loops like errors.luau:201 (__tostring -> luaB_tostring
+		// -> __tostring -> ...) where the chain alternates between
+		// Lua and Go frames; otherwise pure Lua recursion gets the
+		// plain "stack overflow" string that errors.luau:148 wants.
+		hasGo := cl != nil && cl.isGo
+		if !hasGo {
+			// Scan a small window of recent frames; full O(n) walk
+			// is overkill since pure-Lua recursion has all-Lua
+			// frames near the top.
+			lo := len(s.frames) - 16
+			if lo < 0 {
+				lo = 0
+			}
+			for i := len(s.frames) - 1; i >= lo; i-- {
+				if ci := s.frames[i]; ci != nil && ci.cl != nil && ci.cl.isGo {
+					hasGo = true
+					break
+				}
+			}
+		}
+		if hasGo {
+			s.runtimeError("C stack overflow")
+		}
 		s.runtimeError("stack overflow")
 	}
 	ci := &callInfo{
